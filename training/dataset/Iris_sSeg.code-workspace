@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"path": "../../../VSCode_workspace"
+		},
+		{
+			"path": "../../../Downloads/unet-supervised"
+		}
+	],
+	"settings": {}
+}
