@@ -17,9 +17,9 @@ class Config(object):
   def __init__(self):
     args = arguments(
         # root path
-        root_path = '',
+        root_path = 'D:/IRIS_ANNOTATION',
         # json file path
-        json_file_path = '',
+        json_file_path = 'iris.json',
         # data path
         data_path = '',
         # number of classes
@@ -29,8 +29,7 @@ class Config(object):
         model='SAM2',
         checkpoint_dir='checkpoints',
         output_dir="SAM2_output",
-        test_input_dir="test/input",
-        test_output_dir="test/output",
+        test_output_dir="test_pred",
         test_size=0.15,
         val_size=0.15,
         train=True
@@ -38,12 +37,10 @@ class Config(object):
     self.model = args.model
     self.checkpoint_dir = args.checkpoint_dir
     self.output_dir = args.output_dir
-    self.test_input_dir = args.test_input_dir
     self.test_output_dir = args.test_output_dir
     self.train = args.train
     self.num_classes = args.num_classes
     self.img_size = args.img_size
-    self.train_size = args.train_size
     self.test_size = args.test_size
     self.data_path = args.data_path
     self.json_file_path = args.json_file_path
@@ -71,7 +68,7 @@ class IrisDataset(torch.utils.data.Dataset):
         # read mask
         mask = cv2.imread(os.path.join(self.masks_dir, mask_path), 1)  # read RGB
 
-        sample = {'image': image, 'mask': mask}
+        sample = {'image': image, 'mask': mask, 'mask_path': mask_path}
 
         if self.transform:
             sample = self.transform(sample)
@@ -160,7 +157,7 @@ class ToTensorAndNormalize:
 
         # # Convert back to PIL Image for compatibility
         # return Image.fromarray(enhanced_image)
-        return {'image': enhanced_image, 'mask': mask}
+        return {'image': enhanced_image, 'mask': mask, 'mask_path': sample['mask_path']}
 
 transform = ToTensorAndNormalize(img_size=cfg.img_size)
 
@@ -191,6 +188,7 @@ def return_dataset(image_dirs, mask_dirs, transform=None):
     train_dataset = IrisDataset(
         images=train_subset.dataset.images[train_subset.indices],  # Directly access subset data
         masks=train_subset.dataset.masks[train_subset.indices],
+        path=train_subset.dataset.masks_path[train_subset.indices],
         transform=transform  # Apply augmentations
     )
 
@@ -198,12 +196,14 @@ def return_dataset(image_dirs, mask_dirs, transform=None):
     val_dataset = IrisDataset(
         images=val_subset.dataset.images[val_subset.indices],
         masks=val_subset.dataset.masks[val_subset.indices],
+        path=val_subset.dataset.masks_path[val_subset.indices],
         transform=None
     )
 
     test_dataset = IrisDataset(
         images=test_subset.dataset.images[test_subset.indices],
         masks=test_subset.dataset.masks[test_subset.indices],
+        path=test_subset.dataset.masks_path[test_subset.indices],
         transform=None
     )
     return train_dataset, val_dataset, test_dataset
@@ -384,3 +384,11 @@ with torch.no_grad():
       predictions.append(pred_mask)
 cv2.imshow(predictions[0].cpu().numpy())
 cv2.imshow(test_dataset[0]['mask'].numpy())
+cv2.imwrite('test_pred.png', predictions[0].cpu().numpy())
+cv2.imwrite('test_mask.png', test_dataset[0]['mask'].numpy())
+# # Save the predictions
+# for i, pred_mask in enumerate(predictions):
+#     pred_mask = pred_mask.cpu().numpy()
+#     cv2.imwrite(f"test_pred/{i}.png", pred_mask)
+#     print(f"Saved prediction {i}")
+# print("All predictions saved!")
