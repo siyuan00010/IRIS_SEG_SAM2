@@ -249,47 +249,60 @@ def get_mask_mappings():
 
 def extract_mask_regions(masks, mappings):
     '''
-    Args: mask is (B,H,W,C)
-          mappings is a dict of mask labels and colors
+    Args: masks: (B,H,W,C)
+          mappings: a dict of mask labels and colors
             
-    Return: binary masks ((B,H,W))
+    Return: arrays with labels ((B,H,W))
     '''
     masks = masks.numpy()  ## convert it to numpy array
-    segment_masks = np.zeros(masks.shape,dtype=np.uint8)
+    B,H,W,C=masks.shape
+    i=0
+    segment_masks = np.zeros((B,H,W),dtype=np.uint8)
+    for id,color in mappings.values():
+        for b in range(B):
+            coord = np.all(masks[b]==color,axis=-1)
+            segment_masks[b][coord]=id
+            # print(coord)
+    # for mask in masks:
+    #     mask_label = np.zeros((H,W,C),dtype=np.uint8)
+    #     for key,value in mappings.items():
+    #         id,color = value
+    #         color=np.uint8(color)
+    #         if np.all(color == [0,0,0]): # if not labeled
+    #             continue
+    #         if np.all(mask == [0,0,0]): # if not labeled
+    #             continue
+    #         find_color = np.any(mask==color)
+    #         if find_color:
+    #             coord = np.all(mask==color,axis=-1)
+    #             # print(coord)
+    #             mask_label[coord] = id
+    #     print(mask_label)
+    #     segment_masks[i]=mask_label
+    #     i +=1
+    # print(segment_masks.shape)
 
-    for key,value in mappings.items():
-        id,color = value
-        color=np.uint8(color)
-        if np.all(color == [0,0,0]): # if not labeled
-            continue
-        print(color)
-        find_color = np.any(masks==color)
-        if find_color:
-            match = np.where(masks==color)
-            segment_masks[match] = id
-            print(match)
-
-
-    return segment_masks
+    return torch.from_numpy(segment_masks)
 
 '''
 convert mask into points
 '''
 ###############
-def mask_to_points(binary_mask,num_points=10):
+def mask_to_points(mask,num_points=10):
     """
     Args: mask (numpy.ndarray): binary masks of shape (h,w)
 
     Returns: array of points (N,2) where each point is (x,y)
     """
-    y,x=np.where(binary_mask == 1)
+
+    y,x=np.where(mask == 1)
     points=np.column_stack((x,y))
     return points
 
-def prep_prompts(segm_masks=dict):
+def prep_prompts(segm_masks):
     '''
-    Args: segm_masks is a dict contains labels and binary masks array
-    Return: a prompt contains label and points
+    Args: segm_masks is a masks array with labels
+    Return: a prompt contains labels and points
     '''
     prompt = {}
     for label,mask in segm_masks:
@@ -298,7 +311,7 @@ def prep_prompts(segm_masks=dict):
             prompt[label]=np.array(mask_p)
     return prompt
 
-def generate_prompts_from_masks(mask,num_points=10):
+def generate_prompts_from_masks(segmented_mask,total_points=10):
     """Generate random foreground/background points from masks.
         Args:
             masks: (B,H,W) ground-truth binary masks.
@@ -307,21 +320,69 @@ def generate_prompts_from_masks(mask,num_points=10):
             points:(B,N,2) normalized coordinates
             labels: (B,N) point labels (1=foreground, 0=background)
     """
-    B,H,W = mask.shape
-    points =[]
-    labels = []
-    for i in range(B):
-        fg_coords = torch.nonzero(mask[i])
-        fg_indices = torch.randperm(fg_coords.shape[0])[:num_points//2]
-        fg_points = fg_coords[fg_indices].float()/torch.tensor([H,W])
-        bg_coords = torch.nonzero(mask[i]==0)
-        bg_indices = torch.randperm(bg_coords.shape[0])[:num_points//2]
-        bg_points = fg_coords[bg_indices].float()/torch.tensor([H,W])
-    # combine
-    points.append(torch.cat([fg_points,bg_points]))
-    labels.append(torch.cat([torch.ones(num_points//2,torch.zeros(num_points//2))]))
+
+    B,H,W = segmented_mask.shape
+    device = segmented_mask.device
+    points1=[]
+    labels1=[]
+    for b in range(B):
+        batch_points=[]
+        batch_labels=[]
+        unique_labels = torch.unique(segmented_mask[b])
+        unique_labels = unique_labels[unique_labels != 0]
+        
+        for id in unique_labels:
+            mask = (segmented_mask[b] == id)
+            coords = torch.nonzero(mask, as_tuple=False)
+            if coords.shape[0] > 0:
+                normalized_coords = coords.float() / torch.tensor([H, W], device=device)     
+                batch_points.append(normalized_coords)   
+                batch_labels.append(torch.full(size=coords.shape[0],),fill_value=id,device=device, dtype=torch.long)
+                     
+        if batch_points:
+            
+        # Concatenate points/labels for this batch
+           all_coords =(torch.cat(batch_points, dim=0))
+           all_labels=(torch.cat(batch_labels, dim=0))                 
+                
+        else:
+            # If no points found, pad with zeros (or any placeholder)
+           all_coords=(torch.zeros((0, 2), device=device))
+           all_labels=(torch.full((0,), device=device, dtype=torch.long))
+
+        # Handle case with no labels (all zeros)
+        # if not batch_points:
+        #     batch_points = [torch.zeros((num_points * len(unique_labels), 2), device=device)]
+        #     batch_labels = [torch.full((num_points * len(unique_labels), -1), device=device, dtype=torch.long)]
+        num_points= all_coords.shape[0]
+        if num_points>= total_points:
+            indices = torch.randperm(num_points)[:total_points]
+            points=all_coords[indices]
+            labels=all_labels[indices]
+        else:
+            points=torch.cat([all_coords,torch.zeros((total_points - num_points,2),device = device)],dim=0)
+            labels=torch.cat([all_labels,torch.full((total_points - num_points,),-1,device = device,dtype=torch.long)],dim=0)
+
+        
+        points1.append(points)
+        labels1.append(labels)
+
+
+    # mask = torch.tensor(mask)
+    # points =[]
+    # labels = []
+    # fg_coords = torch.nonzero(mask)
+    # fg_indices = torch.randperm(fg_coords.shape[0])[:num_points//2]
+    # fg_points = fg_coords[fg_indices].float()/torch.tensor([B,H,W])
+    # bg_coords = torch.nonzero(mask==0)
+    # bg_indices = torch.randperm(bg_coords.shape[0])[:num_points//2]
+    # bg_points = fg_coords[bg_indices].float()/torch.tensor([B,H,W])
+    # # combine
+    # points.append(torch.cat([fg_points,bg_points]))
+    # labels.append(torch.cat([torch.ones(num_points//2,torch.zeros(num_points//2))]))
+    # print(points,labels)
     
-    return torch.stack(points),torch.stack(labels)
+    return torch.stack(points1),torch.stack(labels1)
 
 def segm_with_prmpt(image,mask):
     segment_masks = extract_mask_regions(mask)
