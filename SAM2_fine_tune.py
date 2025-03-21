@@ -1,40 +1,45 @@
 import os
 import torch
 import cv2
-from torch.utils.data import DataLoader, random_split
+import numpy as np
+import json
+from segment_anything import SamPredictor, sam_model_registry
+from PIL import Image
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
-import random
-import torchvision.transforms.functional as TF
+print(torch.cuda.get_device_name(0))
 class arguments:
     def __init__(self, **kwargs):
         self.__dict__.update(kwargs)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Config(object):
   """Change the args in the "args" variable to change the config"""
 
   def __init__(self):
     args = arguments(
-        # root path
-        root_path = 'D:/IRIS_ANNOTATION',
+        # root path on linux
+        root_path = '/run/media/wvubiometrics/My Passport/IRIS_ANNOTATION',
         # json file path
         json_file_path = 'iris.json',
-        # data path
-        data_path = '',
+        images_dir = 'images',
+        masks_dir = 'annotations',
         # number of classes
-        num_classes = 10,
+        num_classes = 17,
         img_size = 512,
+        # device
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
         # model
         model='SAM2',
-        checkpoint_dir='checkpoints',
-        output_dir="SAM2_output",
-        test_output_dir="test_pred",
+        checkpoint_dir='/home/wvubiometrics/Documents/Molly/IRIS_SEG_SAM2/checkpoints',
+        output_dir="/home/wvubiometrics/Documents/Molly/IRIS_SEG_SAM2/SAM2_output",
+        test_output_dir="/home/wvubiometrics/Documents/Molly/IRIS_SEG_SAM2/SAM2test_pred",
         test_size=0.15,
         val_size=0.15,
         train=True
     )
     self.model = args.model
+    self.device = args.device
     self.checkpoint_dir = args.checkpoint_dir
     self.output_dir = args.output_dir
     self.test_output_dir = args.test_output_dir
@@ -42,109 +47,73 @@ class Config(object):
     self.num_classes = args.num_classes
     self.img_size = args.img_size
     self.test_size = args.test_size
-    self.data_path = args.data_path
+    self.val_size = args.val_size
+    self.images_dir = args.images_dir
+    self.masks_dir = args.masks_dir
     self.json_file_path = args.json_file_path
     self.root_path = args.root_path
 cfg = Config()
-# Load data
-class IrisDataset(torch.utils.data.Dataset):
-    def __init__(self, images_dir, masks_dir, transform = None):
-        self.images_dir = images_dir
-        self.masks_dir = masks_dir
+
+class CreateDataset(Dataset):
+
+    """
+    create a dataset from list of paths
+    """
+
+    def __init__(self,image_list,mask_list,transform):
+        self.image_list = image_list
+        self.mask_list = mask_list
         self.transform = transform
-        self.images = os.listdir(images_dir)
-        self.masks = os.listdir(masks_dir)
-
     def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-
-        img_path = os.path.join(self.images_dir, self.images[idx])
-        mask_path = os.path.join(self.masks_dir, self.masks[idx])
-
-        # read image
-        image = cv2.imread(os.path.join(self.images_dir, img_path), cv2.IMREAD_GRAYSCALE)
-        # read mask
-        mask = cv2.imread(os.path.join(self.masks_dir, mask_path), 1)  # read RGB
-
-        sample = {'image': image, 'mask': mask, 'mask_path': mask_path}
-
+        return len(self.mask_list)
+    def __getitem__(self, index):
+        image = self.image_list[index]
+        mask = self.mask_list[index]
+        if image is None:
+            raise ValueError("Error loading image. Check the file path.")
+        if mask is None:
+            raise ValueError("Error loading mask. Check the file path.")
+        
         if self.transform:
-            sample = self.transform(sample)
+            sample = self.transform((image, mask))  # Pass as tuple
+        else:
+            # convert to tensor
+            sample = {'image': torch.tensor(image), 'mask': torch.tensor(mask)}
+            
 
         return sample
+    
+ 
+class ReturnDataset(Dataset):
+    '''
+    convert subset to dataset
+    '''   
+    def __init__(self, subset):
+        self.subset = subset
+    def __len__(self):
+        return len(self.subset)
+    
+    def __getitem__(self, idx):
+        sample = self.subset[idx]
+        return {'image': sample['image'], 'mask': sample['mask']}
 
-# # calculate class distributions
-# from sklearn.model_selection import train_test_split
-
-# full_dataset = IrisDataset(cfg.images_dir, cfg.masks_dir)
-# # Split indices while preserving class balance
-# indices = list(range(len(full_dataset)))
-# train_indices, test_indices = train_test_split(
-#     indices, 
-#     test_size=0.3, 
-#     stratify=class_labels,  # Approximated from masks
-#     random_state=42
-# )
-# train_indices, val_indices = train_test_split(
-#     train_indices, 
-#     test_size=0.15/0.7,  # 15% of full dataset
-#     stratify=class_labels[train_indices],
-#     random_state=42
-# )
 # transform
 class ToTensorAndNormalize:
     def __init__(self, img_size):
         self.img_size = img_size  # Set the desired image size
-        # self.random_flip = transforms.RandomHorizontalFlip(0.5)
+        self.random_flip = transforms.RandomHorizontalFlip(0.5)
 
-    def __call__(self, sample):
+    def __call__(self,sample):
 
-        image, mask = sample['image'], sample['mask']
-
-        # # Convert to PIL Image if not already
-        # if not isinstance(image, Image.Image):
-        #     image = Image.fromarray(image)
-
-        # get image width, height, and channels
-        width,height,channel = image.shape
-        # get mask width, height, and channels
-        mask_width,mask_height,mask_channel = mask.shape
-        
+        image, mask = sample
         # convert to tensor
-        image = transforms.ToTensor()(image)
-        mask = transforms.ToTensor()(mask)
+        image_tensor = torch.tensor(image)
+        mask_tensor = torch.tensor(mask)
+
         # resize image and mask
-        image = cv2.resize(image, (self.img_size, self.img_size))
-        mask = cv2.resize(mask, (self.img_size, self.img_size))
-
-        # normalize
-        image = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-        # Apply the same spatial augmentations to both image and mask
-        if random.random() > 0.5:
-            # Random horizontal flip
-            image = TF.hflip(image)
-            mask = TF.hflip(mask)
-        if random.random() > 0.5:
-            # Random vertical flip
-            image = TF.vflip(image)
-            mask = TF.vflip(mask)
-        if random.random() > 0.5:
-            # Random rotation (-15 to +15 degrees)
-            angle = random.uniform(-15, 15)
-            image = TF.rotate(image, angle)
-            mask = TF.rotate(mask, angle)
-        
-        # Color jitter (only on the image)
-        brightness = random.uniform(0.8, 1.2)
-        contrast = random.uniform(0.8, 1.2)
-        image = TF.adjust_brightness(image, brightness)
-        image = TF.adjust_contrast(image, contrast)
-  
-        if image is None:
-            raise ValueError("Error loading image. Check the file path.")
+        image = cv2.resize(image_tensor.numpy(), (self.img_size, self.img_size))
+        mask = cv2.resize(mask_tensor.numpy(), (self.img_size, self.img_size))
+        # print('mask tensor shape; ', mask.shape)
 
         ### histogram equalization
 
@@ -155,80 +124,216 @@ class ToTensorAndNormalize:
         clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
         enhanced_image = clahe.apply(blurred_image)
 
-        # # Convert back to PIL Image for compatibility
-        # return Image.fromarray(enhanced_image)
-        return {'image': enhanced_image, 'mask': mask, 'mask_path': sample['mask_path']}
+        image = np.expand_dims(enhanced_image,axis=0) # color dim expected 3 channels in image encoder
+        image = np.repeat(image,3,axis=0)
+        image_tensor = torch.tensor(image)
+        mask_tensor = torch.tensor(mask)
+        # print(image_tensor.shape,image_tensor.shape)
 
-transform = ToTensorAndNormalize(img_size=cfg.img_size)
+        # normalize
+        image = transforms.Normalize(mean=[0.5], std=[0.5])
+        
+        normalized = image(image_tensor.to(torch.float32))
 
-# Create the datasets
-def return_dataset(image_dirs, mask_dirs, transform=None):
-    # Loop through each pair of image and mask directories
-    for img_dir, msk_dir in zip(image_dirs, mask_dirs):
-        # Debug print to check the number of files in each directory
-        print(f"Images in {img_dir}: {len(os.listdir(img_dir))}")
-        print(f"Masks in {msk_dir}: {len(os.listdir(msk_dir))}")
+        return {'image': normalized, 'mask': mask_tensor}
+    
+##############################
+### split the full dataset     
+def split_subset(dataset):
+    num_data = len(dataset)
+    print('dataset len:',num_data)
+    val_data_size = np.ceil(cfg.val_size*num_data).astype(int)
+    test_data_size = np.ceil(cfg.test_size*num_data).astype(int)
+    train_data_size = num_data - val_data_size - test_data_size
 
-        if len(os.listdir(img_dir)) == 0:
-            print(f"Warning: {img_dir} is empty, skipping.")
-            continue
-    # Load iris dataset
-    full_dataset = IrisDataset(cfg.images_dir, cfg.masks_dir)
-
-    # Split into train/val/test
-    len = len(full_dataset)
-    train_size = 1 - cfg.test_size - cfg.val_size
+    # print('the training size is :',train_data_size)
+    # print('the val and test size is : ',val_data_size,test_data_size)
 
     train_subset, val_subset, test_subset = random_split(
-        full_dataset, [train_size*len, cfg.val_size*len, cfg.test_size*len],
+        dataset, [train_data_size,val_data_size,test_data_size],
         generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
     )
+    # print('a train subset contains: ', train_subset[0])
 
-    # Apply transforms ONLY to the training subset
-    train_dataset = IrisDataset(
-        images=train_subset.dataset.images[train_subset.indices],  # Directly access subset data
-        masks=train_subset.dataset.masks[train_subset.indices],
-        path=train_subset.dataset.masks_path[train_subset.indices],
-        transform=transform  # Apply augmentations
+    return train_subset, val_subset, test_subset
+
+# Create the datasets
+def return_dataset(image_dir, mask_dir,batch_size):
+
+    img_paths = sorted([os.path.join(image_dir, f) for f in os.listdir(image_dir)])
+    mask_paths = sorted([os.path.join(mask_dir, f) for f in os.listdir(mask_dir)])
+ 
+    bad = "/run/media/wvubiometrics/My Passport/IRIS_ANNOTATION/annotations/06234d25.png"
+    while bad in mask_paths:
+        mask_paths.remove(bad)
+    mask_paths.sort()
+
+    # read image
+    images = [cv2.imread(os.path.join(image_dir, path),0) for path in img_paths] # grayscale
+    masks = [cv2.imread(os.path.join(mask_dir, path), 1) for path in mask_paths]
+
+    # print('masks: ',masks[0].shape)
+
+
+    if cfg.train:
+        transform = ToTensorAndNormalize(cfg.img_size)
+        dataset = CreateDataset(images,masks,transform=transform)
+        # # calculate class distributions
+
+    else:
+        dataset = CreateDataset(images,masks,None)
+
+    # Load iris subset
+    train_dataset, val_dataset, test_dataset = split_subset(dataset)
+
+    train_sample = ReturnDataset(train_dataset)
+    val_sample = ReturnDataset(val_dataset)
+    test_sample = ReturnDataset(test_dataset)
+    # print('train len: ', len(train_sample))
+    # for batch in train_sample:
+    #     print(batch['mask'].shape)
+
+
+    train_loader = DataLoader(
+        train_sample,
+        batch_size=batch_size,
+        shuffle=True,    # Critical for training
+        num_workers=2,
+        pin_memory=True
     )
 
-    # Validation and test sets (no transforms)
-    val_dataset = IrisDataset(
-        images=val_subset.dataset.images[val_subset.indices],
-        masks=val_subset.dataset.masks[val_subset.indices],
-        path=val_subset.dataset.masks_path[val_subset.indices],
-        transform=None
+    val_loader = DataLoader(
+        val_sample,
+        batch_size=batch_size,
+        shuffle=False,   # No need to shuffle validation
+        num_workers=2
     )
 
-    test_dataset = IrisDataset(
-        images=test_subset.dataset.images[test_subset.indices],
-        masks=test_subset.dataset.masks[test_subset.indices],
-        path=test_subset.dataset.masks_path[test_subset.indices],
-        transform=None
+    test_loader = DataLoader(
+        test_sample,
+        batch_size=1,    # Batch size 1 for per-image evaluation
+        shuffle=False
     )
-    return train_dataset, val_dataset, test_dataset
-# Modified mask decoder if dataset size > 10k
-# Modify the mask decoder for multi-class output for large dataset
-class SAM2IrisMaskDecoder(torch.nn.Module):
-    def __init__(self, original_decoder, num_classes):
-        super().__init__()
-        self.original_decoder = original_decoder
-        # Replace the output layer with a classification head
-        self.classifier = torch.nn.Conv2d(256, num_classes, kernel_size=1)  # 256 is SAM's mask embedding dim
+    # print('a test loader:', test_loader.dataset[0])
 
-    def forward(self, image_embeddings):
-        # Pass dummy prompts (not used, placeholder for SAM2 decoder)
-        dummy_prompts = torch.zeros(image_embeddings.shape[0], 1, 256, device=image_embeddings.device)
-        # Generate mask embeddings
-        masks, _ = self.original_decoder(
-            image_embeddings=image_embeddings,
-            image_pe=dummy_prompts,  # Placeholder
-            sparse_prompt_embeddings=None,
-            dense_prompt_embeddings=None,
-        )
-        # Convert to class logits
-        return self.classifier(masks)
+    return train_loader, val_loader, test_loader
+
+def load_json(filename):
+    """Reads a JSON file and returns the data as a dictionary."""
+    try:
+        with open(filename, 'r', encoding='utf-8') as file:
+            data = json.load(file)  # Load JSON data into a dictionary
+        return data  # Return the dictionary with keys and values
+    except FileNotFoundError:
+        print(f"Error: The file '{filename}' was not found.")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error: The file '{filename}' is not a valid JSON file.")
+        return None
+
+def get_mask_mappings():
+
+    json_data = load_json(cfg.root_path + '/'+cfg.json_file_path)
+    keys = []
+    values = {}
+    mappings = {}
+    for key, value in json_data.items():
+        keys.append(key)
+        values.update(value)
+    for key, value in values.items():
+        keys.append(key)
+        mappings.setdefault(value['name'],(value['id'],value['color']))
+    # print(id_color_dict.values())
+    cfg.num_classes = len(mappings)
+    return mappings
+
+def extract_mask_regions(masks, mappings):
+    '''
+    Args: mask is (B,H,W,C)
+          mappings is a dict of mask labels and colors
+            
+    Return: binary masks ((B,H,W))
+    '''
+    masks = masks.numpy()  ## convert it to numpy array
+    segment_masks = np.zeros(masks.shape,dtype=np.uint8)
+
+    for key,value in mappings.items():
+        id,color = value
+        color=np.uint8(color)
+        if np.all(color == [0,0,0]): # if not labeled
+            continue
+        print(color)
+        find_color = np.any(masks==color)
+        if find_color:
+            match = np.where(masks==color)
+            segment_masks[match] = id
+            print(match)
+
+
+    return segment_masks
+
+'''
+convert mask into points
+'''
+###############
+def mask_to_points(binary_mask,num_points=10):
+    """
+    Args: mask (numpy.ndarray): binary masks of shape (h,w)
+
+    Returns: array of points (N,2) where each point is (x,y)
+    """
+    y,x=np.where(binary_mask == 1)
+    points=np.column_stack((x,y))
+    return points
+
+def prep_prompts(segm_masks=dict):
+    '''
+    Args: segm_masks is a dict contains labels and binary masks array
+    Return: a prompt contains label and points
+    '''
+    prompt = {}
+    for label,mask in segm_masks:
+        mask_p = mask_to_points(mask)
+        if len(mask_p)>0:
+            prompt[label]=np.array(mask_p)
+    return prompt
+
+def generate_prompts_from_masks(mask,num_points=10):
+    """Generate random foreground/background points from masks.
+        Args:
+            masks: (B,H,W) ground-truth binary masks.
+            num_points: Number of points to sample.
+        Returns: 
+            points:(B,N,2) normalized coordinates
+            labels: (B,N) point labels (1=foreground, 0=background)
+    """
+    B,H,W = mask.shape
+    points =[]
+    labels = []
+    for i in range(B):
+        fg_coords = torch.nonzero(mask[i])
+        fg_indices = torch.randperm(fg_coords.shape[0])[:num_points//2]
+        fg_points = fg_coords[fg_indices].float()/torch.tensor([H,W])
+        bg_coords = torch.nonzero(mask[i]==0)
+        bg_indices = torch.randperm(bg_coords.shape[0])[:num_points//2]
+        bg_points = fg_coords[bg_indices].float()/torch.tensor([H,W])
+    # combine
+    points.append(torch.cat([fg_points,bg_points]))
+    labels.append(torch.cat([torch.ones(num_points//2,torch.zeros(num_points//2))]))
     
+    return torch.stack(points),torch.stack(labels)
+
+def segm_with_prmpt(image,mask):
+    segment_masks = extract_mask_regions(mask)
+    prompt = prep_prompts(segment_masks)
+    predictor.set_image(image)
+    masks,_,_ = predictor.predict(
+        point_coords=prompt,
+        point_labels=np.ones(len(prompt)),
+        multimask_output=False # single mask per prompt
+    )
+    return masks
+
 # Loss functions
 def loss_function(pred, target):
     # pred: (B, C, H, W), target: (B, H, W) with class indices
@@ -250,57 +355,29 @@ def IoU(pred, target, smooth=1e-6):
     union = (pred != 0).sum() + (target != 0).sum() - intersection
     return (intersection + smooth) / (union + smooth)
 
+'''
+main loop
+'''
 # training
+
 batch_size = 8  # Small batch size for limited data
-tranform = ToTensorAndNormalize(cfg.img_size)
-train_dataset, val_dataset, test_dataset = return_dataset(cfg.image_dirs, cfg.mask_dirs, transform=tranform)
+images_dir = os.path.join(cfg.root_path,cfg.images_dir)
+masks_dir = os.path.join(cfg.root_path,cfg.masks_dir)
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=batch_size,
-    shuffle=True,    # Critical for training
-    num_workers=2,
-    pin_memory=True
-)
+train_dataloader, val_dataloader, test_dataloader = return_dataset(images_dir, masks_dir,batch_size)
+mappings = get_mask_mappings()
 
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=batch_size,
-    shuffle=False,   # No need to shuffle validation
-    num_workers=2
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=1,    # Batch size 1 for per-image evaluation
-    shuffle=False
-)
-
-# Check a training batch
-for images, masks in train_loader:
-    # check if a mask is a class-indexed tensor
-    print("Training batch shapes:", images.shape, masks.shape)
-    break  # Only check first batch
-
-# Check validation (no transforms)
-for images, masks in val_loader:
-    print("Validation batch (no transforms):", images.shape, masks.shape)
-    break
-# # Modified mask decoder for training SAM2 when dataset is large
-# sam.mask_decoder = SAM2IrisMaskDecoder(sam.mask_decoder, num_classes=cfgs.num_classes)
-import torch
-### fine tuning on original mask decoder for small dataset
-from segment_anything import sam_model_registry
+# for batch in train_dataloader:
+#     image,mask = batch["image"],batch["mask"]
+#     print('batch in train loader: ',image.shape, mask.shape)
 
 # Load SAM2 and freeze the encoder
-sam = sam_model_registry["vit_b"](checkpoint="sam_vit_b_01ec64.pth")
-# Remove the prompt encoder (not needed)
-sam.prompt_encoder = None
+sam = sam_model_registry["vit_b"](checkpoint=f"{cfg.checkpoint_dir}/sam_vit_b_01ec64.pth")
+predictor = SamPredictor(sam)
 
 # Freeze the image encoder (no gradients)
 for param in sam.image_encoder.parameters():
     param.requires_grad = False # <--- unfreeze for >10k images
-    
 # Unfreeze the mask decoder (fine-tune it)
 for param in sam.mask_decoder.parameters():
     param.requires_grad = True  # <--- Only change from earlier!
@@ -310,35 +387,65 @@ criterion = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(sam.mask_decoder.parameters(), lr=1e-5) # small lr for fine tuning
 
 best_val_iou = 0.0
-patience = 15  # Stop if no improvement for 15 epochs
+patience = 10  # Stop if no improvement for 15 epochs
 epochs_without_improvement = 0
 
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+scheduler = ReduceLROnPlateau(
     optimizer, mode="max", factor=0.5, patience=5, verbose=True
 )
-
-for epoch in range(num_epochs=100):
+mapping = get_mask_mappings()
+for epoch in range(100):
     # Training phase
+    loss = 0.0
     sam.train()
-    for images, masks in train_loader:
+    i=0
+    for batch in train_dataloader:
+        images,masks = batch["image"],batch["mask"]
+        # print(masks.shape)
+        ##################
+
+        # Adjust tensor shape to n,64,64,c
+        images = np.repeat(images,2,axis=3)
+        images = np.repeat(images,2,axis=2)
+
+        images = torch.tensor(images,dtype=torch.float32)
         # Forward pass
         image_embeddings = sam.image_encoder(images)
-        outputs = sam.mask_decoder(image_embeddings)
+        masks = extract_mask_regions(masks,mapping)        
+        points,labels = generate_prompts_from_masks(masks)#########
+        sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+            points = (points,labels),
+            boxes = None,
+            masks = None
+        )
+
+        outputs,_ = sam.mask_decoder(image_embeddings=image_embeddings,
+                                     image_pe=sam.prompt_encoder.get_dense_pe(),
+                                     sparse_prompt_embeddings=sparse_embeddings,
+                                     dense_prompt_embeddings=dense_embeddings)
         loss = criterion(outputs, masks)
         
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        i+=1
+        print(f'step {i}/8, loss: {loss:.4f}')
+    loss += loss
+    print(f'epoch {epoch}/100,\nloss: {loss:.4f}')
 
     # Validation phase
     sam.eval()
     val_iou = 0.0
     with torch.no_grad():
-        for images, masks in val_loader:
+        for batch in val_dataloader:
+            images,masks = batch["image"],batch["mask"]
             outputs = sam.mask_decoder(sam.image_encoder(images))
             val_iou += IoU(outputs, masks)
-    val_iou /= len(val_loader)
+            val_dice += dice_score(outputs,masks)
+    val_iou /= len(val_dataloader)
+    val_dice /= len(val_dice)
+    print(f'epoch {epoch}/100,\nval_IoU: {val_iou:.2f},val_dice: {val_dice:.2f}')
 
     scheduler.step(val_iou)  # Adjust LR based on validation IoU
 
@@ -348,7 +455,7 @@ for epoch in range(num_epochs=100):
         best_val_iou = current_val_iou
         epochs_without_improvement = 0
         # best iou checkpoint
-        torch.save(sam.mask_decoder.state_dict(), "best_iris_sam2.pt")
+        torch.save(sam.mask_decoder.state_dict(), f"{cfg.checkpoint_dir}/best_iris_sam2.pt")
         print(f"Saved best model at epoch {epoch} with IoU {val_iou:.4f}")
     
     else:
@@ -363,32 +470,34 @@ for epoch in range(num_epochs=100):
             "epoch": epoch,
             "model": sam.mask_decoder.state_dict(),
             "optimizer": optimizer.state_dict(),
-        }, f"checkpoints/epoch_{epoch}.pt")
+        }, f"{cfg.checkpoint_dir}/epoch_{epoch}.pt")
 
 # Load the best model
-checkpoint = torch.load("checkpoints/epoch_10.pt")
-sam.mask_decoder.load_state_dict(checkpoint["model_state"])
+checkpoint = torch.load(f"{cfg.checkpoint_dir}/epoch_10.pt")
+sam.mask_decoder.load_state_dict(checkpoint["model"])
+
 optimizer.load_state_dict(checkpoint["optimizer_state"])
 # start_epoch = checkpoint["epoch"] + 1  # Resume training from next epoch
-best_model = torch.load("best_iris_sam2.pt")
+best_model = torch.load(f"{cfg.checkpoint_dir}/best_iris_sam2.pt")
 sam.mask_decoder.load_state_dict(best_model["model_state"])
 optimizer.load_state_dict(best_model["optimizer_state"])
 # Evaluation
 predictions = []
 sam.eval()
 with torch.no_grad():
-    for test_image, test_mask in test_loader:
+    for batch in test_dataloader:
+      test_image, test_mask = batch['image'],batch['mask']
       image_embeddings = sam.image_encoder(test_image)
       logits = sam.mask_decoder(image_embeddings)
       pred_mask = logits.argmax(dim=1)  # (H, W) class indices
       predictions.append(pred_mask)
-cv2.imshow(predictions[0].cpu().numpy())
-cv2.imshow(test_dataset[0]['mask'].numpy())
-cv2.imwrite('test_pred.png', predictions[0].cpu().numpy())
-cv2.imwrite('test_mask.png', test_dataset[0]['mask'].numpy())
-# # Save the predictions
-# for i, pred_mask in enumerate(predictions):
-#     pred_mask = pred_mask.cpu().numpy()
-#     cv2.imwrite(f"test_pred/{i}.png", pred_mask)
-#     print(f"Saved prediction {i}")
-# print("All predictions saved!")
+cv2.imshow("Prediction", predictions[0].cpu().numpy())
+cv2.imshow("Test Mask",test_dataloader[0]['mask'].numpy())
+# cv2.imwrite('test_pred.png', predictions[0].cpu().numpy())
+# # cv2.imwrite('test_mask.png', test_dataloader[0]['mask'].numpy())
+# Save the predictions
+for i, pred_mask in enumerate(predictions):
+    pred_mask = pred_mask.cpu().numpy()
+    cv2.imwrite(f"test_pred/{i}.png", pred_mask)
+    print(f"Saved prediction {i}")
+print("All predictions saved!")
