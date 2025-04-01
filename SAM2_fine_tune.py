@@ -63,6 +63,7 @@ class CreateDataset(Dataset):
 
     """
     create a dataset from list of images and masks
+    Return a dict of image, mask, and file_name
     """
 
     def __init__(self,image_list,mask_list,file_names,transform):
@@ -83,11 +84,9 @@ class CreateDataset(Dataset):
         
         if self.transform:
             image,mask = self.transform((image, mask))  # Pass as tuple
-            sample = {'image': torch.tensor(image), 'mask': torch.tensor(mask), 'file_name': file_name}
-
+            sample = {'image': image, 'mask': mask, 'file_name': file_name}
         else:
-            # convert to tensor
-            sample = {'image': torch.tensor(image), 'mask': torch.tensor(mask), 'file_name': file_name}
+            sample = {'image': image, 'mask': mask, 'file_name': file_name}
         return sample
     
  
@@ -102,11 +101,14 @@ class ReturnDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.subset[idx]
-        sample = {'image': sample['image'], 'mask': sample['mask'],'file_name':sample['file_name']}
-        return sample
+        return {'image': sample['image'], 'mask': sample['mask'], 'file_name': sample['file_name']}
 
 # transform
 class ToTensorAndNormalize:
+    '''
+    Tranform images and masks
+    Return transformed image tensor and mask tensor
+    '''
     def __init__(self, img_size):
         self.img_size = img_size  # Set the desired image size
         self.random_flip = transforms.RandomHorizontalFlip(0.5)
@@ -126,10 +128,11 @@ class ToTensorAndNormalize:
 
         image = np.expand_dims(enhanced_image,axis=0) # color dim expected 3 channels in image encoder
         image = np.repeat(image,3,axis=0)
-        image_tensor = torch.tensor(image)
-        mask_tensor = torch.tensor(mask)
-        # print(image_tensor.shape,image_tensor.shape)
 
+        # convert to tensor
+        image_tensor = torch.from_numpy(image)
+        mask_tensor = torch.from_numpy(mask)
+        # print(image_tensor.shape,image_tensor.shape)
         return image_tensor, mask_tensor
     
 ### split the full dataset     
@@ -192,8 +195,8 @@ def return_dataset(image_dir, mask_dir,batch_size):
         transform = ToTensorAndNormalize(cfg.img_size)
         dataset = CreateDataset(images, masks, file_names, transform=transform)
     else:
-        # transform = ToTensorAndNormalize(cfg.img_size)
-        dataset = CreateDataset(images, masks, file_names, transform=None)
+        transform = ToTensorAndNormalize(cfg.img_size)
+        dataset = CreateDataset(images, masks, file_names, transform=transform)
 
     # Load iris subset
     train_dataset, val_dataset, test_dataset = split_subset(dataset)
