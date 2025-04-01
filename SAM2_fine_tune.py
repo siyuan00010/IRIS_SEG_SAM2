@@ -82,14 +82,12 @@ class CreateDataset(Dataset):
             raise ValueError("Error loading mask. Check the file path.")
         
         if self.transform:
-            transformed = self.transform((image, mask))  # Pass as tuple
-            image,mask = transformed
-            sample = image, mask, file_name
+            image,mask = self.transform((image, mask))  # Pass as tuple
+            sample = {'image': torch.tensor(image), 'mask': torch.tensor(mask), 'file_name': file_name}
 
         else:
             # convert to tensor
             sample = {'image': torch.tensor(image), 'mask': torch.tensor(mask), 'file_name': file_name}
-            
         return sample
     
  
@@ -104,7 +102,8 @@ class ReturnDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.subset[idx]
-        return {'image': sample['image'], 'mask': sample['mask'], 'file_name': sample['file_name']}
+        sample = {'image': sample['image'], 'mask': sample['mask'],'file_name':sample['file_name']}
+        return sample
 
 # transform
 class ToTensorAndNormalize:
@@ -114,7 +113,7 @@ class ToTensorAndNormalize:
 
     def __call__(self,sample):
 
-        image, mask, file_name = sample
+        image, mask = sample
         image = cv2.resize(image, (self.img_size, self.img_size))
         mask = cv2.resize(mask,(self.img_size, self.img_size) )
         ### histogram equalization
@@ -131,7 +130,7 @@ class ToTensorAndNormalize:
         mask_tensor = torch.tensor(mask)
         # print(image_tensor.shape,image_tensor.shape)
 
-        return {'image': image_tensor, 'mask': mask_tensor, 'file_name': file_name}
+        return image_tensor, mask_tensor
     
 ### split the full dataset     
 def split_subset(dataset):
@@ -193,8 +192,8 @@ def return_dataset(image_dir, mask_dir,batch_size):
         transform = ToTensorAndNormalize(cfg.img_size)
         dataset = CreateDataset(images, masks, file_names, transform=transform)
     else:
-        transform = ToTensorAndNormalize(cfg.img_size)
-        dataset = CreateDataset(images, masks, file_names, transform=transform)
+        # transform = ToTensorAndNormalize(cfg.img_size)
+        dataset = CreateDataset(images, masks, file_names, transform=None)
 
     # Load iris subset
     train_dataset, val_dataset, test_dataset = split_subset(dataset)
