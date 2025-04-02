@@ -260,29 +260,29 @@ def get_mask_mappings():
 
 def replace_with_labels(masks, mappings):
     '''
-    Args: masks: (B,H,W,C)
+    Args: masks: (B,C,H,W)
           mappings: a dict of mask labels and colors
             
     Return: arrays with labels ((B,H,W))
     '''
     masks = masks.numpy()  ## convert it to numpy array
-    B,H,W,C=masks.shape
+    B,C,H,W=masks.shape
     i=0
     segment_masks = np.zeros((B,H,W),dtype=np.uint8)
     for id,color in mappings.values():
         for b in range(B):
-            coord = np.all(masks[b]==color,axis=-1)
+            coord = np.all(masks[b].transpose(1,2,0)==color,axis=-1)
             segment_masks[b][coord]=id
     return torch.from_numpy(segment_masks)
 
 def generate_prompts_from_masks(segmented_mask,total_points=10):
-    """Generate random foreground/background points from masks.
+    """Generate random label-point from masks.
         Args:
-            masks: (B,H,W) ground-truth binary masks.
-            num_points: Number of points to sample.
+            masks: (B,H,W) labeled masks.
+            total_points: Number of points to sample.
         Returns: 
-            points:(B,N,2) normalized coordinates
-            labels: (B,N) point labels (1=foreground, 0=background)
+            points:(B,N,2) normalized coordinates (N is number of points)
+            labels: (B,N) point labels (0 unlabeled, 1 eye, 2....etc)
     """
 
     B,H,W = segmented_mask.shape
@@ -292,44 +292,48 @@ def generate_prompts_from_masks(segmented_mask,total_points=10):
     for b in range(B):
         batch_points=[]
         batch_labels=[]
-        unique_labels = torch.unique(segmented_mask[b])
-        unique_labels = unique_labels[unique_labels != 0]
-        
-        for id in unique_labels:
-            mask = (segmented_mask[b] == id)
-            coords = torch.nonzero(mask, as_tuple=False)
-            if coords.shape[0] > 0:
-                normalized_coords = coords.float() / torch.tensor([H, W], device=device)     
-                batch_points.append(normalized_coords)   
-                batch_labels.append(torch.full(size=coords.shape[0],),fill_value=id,device=device, dtype=torch.long)
-                     
+        unique_labels = torch.unique(segmented_mask[b]) # the number of unique ids
+        unique_labels = unique_labels[unique_labels != 0] # exclude unlabeled
+
+        # Vectorized extraction of coordinates for all labels at once
+        coords = torch.nonzero(segmented_mask[b] != 0, as_tuple=False)  # Get all non-background coordinates
+        if coords.shape[0] > 0:
+            # Iterate through unique labels to assign proper labels to points
+            for label in unique_labels:
+                # Mask for the current label
+                label_mask = (segmented_mask[b] == label)
+                # Filter out the coordinates for this label
+                label_coords = coords[(label_mask[coords[:, 0], coords[:, 1]]), :]
+                label_coords_normalized = label_coords.float() / torch.tensor([H, W], device=device)
+                # Store coordinates and corresponding label
+                batch_points.append(label_coords_normalized)
+                batch_labels.append(torch.full((label_coords.shape[0],), label, device=device, dtype=torch.long))
+
         if batch_points:
             
-        # Concatenate points/labels for this batch
-           all_coords =(torch.cat(batch_points, dim=0))
-           all_labels=(torch.cat(batch_labels, dim=0))                 
+            # Concatenate points/labels for this batch
+            all_coords =(torch.cat(batch_points, dim=0))
+            all_labels=(torch.cat(batch_labels, dim=0))                 
                 
         else:
             # If no points found, pad with zeros (or any placeholder)
-           all_coords=(torch.zeros((0, 2), device=device))
-           all_labels=(torch.full((0,), device=device, dtype=torch.long))
+            all_coords=(torch.zeros((0, 2), device=device))
+            all_labels=(torch.full((0,), device=device, dtype=torch.long))
 
-        # Handle case with no labels (all zeros)
-        # if not batch_points:
-        #     batch_points = [torch.zeros((num_points * len(unique_labels), 2), device=device)]
-        #     batch_labels = [torch.full((num_points * len(unique_labels), -1), device=device, dtype=torch.long)]
-        num_points= all_coords.shape[0]
-        if num_points>= total_points:
+        # If fewer points than required, pad with zeros and label -1
+        num_points = all_coords.shape[0]
+        if num_points >= total_points:
             indices = torch.randperm(num_points)[:total_points]
-            points=all_coords[indices]
-            labels=all_labels[indices]
+            points = all_coords[indices]
+            labels = all_labels[indices]
         else:
-            points=torch.cat([all_coords,torch.zeros((total_points - num_points,2),device = device)],dim=0)
-            labels=torch.cat([all_labels,torch.full((total_points - num_points,),-1,device = device,dtype=torch.long)],dim=0)
-
+            points = torch.cat([all_coords, torch.zeros((total_points - num_points, 2), device=device)], dim=0)
+            labels = torch.cat([all_labels, torch.full((total_points - num_points,), -1, device=device, dtype=torch.long)], dim=0)
         
-        points1.append(points)
         labels1.append(labels)
+        # scale them back to the image size (H, W)
+        points_scaled = points * torch.tensor([segmented_mask.shape[1], segmented_mask.shape[2]], dtype=torch.float)
+        points1.append(points_scaled)
 
     return torch.stack(points1),torch.stack(labels1)
 
