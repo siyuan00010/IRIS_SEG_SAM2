@@ -3,7 +3,7 @@ import torch
 import cv2
 import numpy as np
 import json
-from segment_anything import SamPredictor, sam_model_registry
+from segment_anything import sam_model_registry
 from PIL import Image
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -331,7 +331,25 @@ def generate_prompts_from_masks(segmented_mask,total_points=10):
         points1.append(points_scaled)
 
     return torch.stack(points1),torch.stack(labels1)
-
+def label_to_rgb(label_tensor,mapping):
+    """
+    Convert a tensor of class indices to RGB colors based on a predefined color map
+    Args:
+        label_tensor: (H, W) tensor of class indices (int)
+    Returns:
+        rgb_tensor: (3, H, W) tensor of RGB values (float 0-1)
+    """
+    # Initialize RGB tensor
+    h, w = label_tensor.shape
+    rgb = torch.zeros((3, h, w), dtype=torch.float32)
+    
+    # Map each class to its color
+    for class_idx, color in mapping.values():
+        mask = (label_tensor == class_idx)
+        for c in range(3):  # R,G,B channels
+            rgb[c][mask] = color[c] / 255.0  # Normalize to 0-1
+    
+    return rgb
 # Loss functions
 def loss_function(pred, target):
     # pred: (B, C, H, W), target: (B, H, W) with class indices
@@ -445,7 +463,7 @@ def main():
             optimizer, mode="max", factor=0.5, patience=5, verbose=True
         )
         mapping = get_mask_mappings()
-        epoch_size = 100
+        epoch_size = 20
         for epoch in range(epoch_size):
             # Training phase
             loss = 0.0
@@ -454,8 +472,8 @@ def main():
             for batch in train_dataloader:
                 images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                 # Adjust tensor shape to n,64,64,c
-                images = np.repeat(images,cfg.img_size//64,axis=3)
-                images = np.repeat(images,cfg.img_size//64,axis=2)
+                images = np.repeat(images,cfg.img_size/64,axis=3)
+                images = np.repeat(images,cfg.img_size/64,axis=2)
 
                 images = torch.tensor(images,dtype=torch.float32)
                 # Forward pass
@@ -474,9 +492,11 @@ def main():
                                             sparse_prompt_embeddings=sparse_embeddings,
                                             dense_prompt_embeddings=dense_embeddings,
                                             multimask_output=True)
+               
                 masks=masks.permute(0,3,1,2)
                 masks=F.interpolate(masks, size=(256, 256), mode='bilinear', align_corners=False)
                 masks = masks.float()
+                masks = masks/255
 
                 loss = criterion(outputs, masks)
                 
@@ -497,8 +517,8 @@ def main():
                     for batch in val_dataloader:
                         images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                         # Adjust tensor shape to n,64,64,c
-                        images = np.repeat(images,cfg.img_size//64,axis=3)
-                        images = np.repeat(images,cfg.img_size//64,axis=2)
+                        images = np.repeat(images,cfg.img_size/64,axis=3)
+                        images = np.repeat(images,cfg.img_size/64,axis=2)
                         images = torch.tensor(images,dtype=torch.float32)
                         # Forward pass
                         image_embeddings = sam.image_encoder(images)
@@ -514,13 +534,13 @@ def main():
                                                     sparse_prompt_embeddings=sparse_embeddings,
                                                     dense_prompt_embeddings=dense_embeddings,
                                                     multimask_output=True)
-                        # print('OUT SHAPE: ',outputs.shape)
+                        print('OUT SHAPE: ',outputs.shape)
                         val_iou += IoU(outputs, masks)
                         val_dice += dice_score(outputs,masks)
-                        os.makedirs(cfg.root_path+ '\\'+cfg.test_output_dir +'\\' , exist_ok=True)
-                        save_img(tensor2img(masks[0].detach()[i].float().cpu()), cfg.root_path+ '\\'+cfg.test_output_dir +'\\'  + str(epoch)+'_' + f'{file_name[:-5]}Mask.png')
-                        save_img(tensor2img(outputs[0].detach()[i].float().cpu()), cfg.root_path+ '\\'+cfg.test_output_dir +'\\'  + str(epoch)+'_' + f'{file_name[:-5]}Pred.png')
-                        save_img(tensor2img(images[0].detach()[i].cpu()/255), cfg.root_path+ '\\'+cfg.test_output_dir +'\\'  + str(epoch)+'_' + f'{file_name[:-5]}.png')
+                        os.makedirs(cfg.root_path+ '/'+cfg.test_output_dir +'/' , exist_ok=True)
+                        save_img(tensor2img(masks[0].detach()[i].float().cpu()), cfg.root_path+ '/'+cfg.test_output_dir +'/'  + str(epoch)+'_' + f'{file_name[:-5]}Mask.png')
+                        save_img(tensor2img(outputs[0].detach()[i].float().cpu()), cfg.root_path+ '/'+cfg.test_output_dir +'/'  + str(epoch)+'_' + f'{file_name[:-5]}Pred.png')
+                        save_img(tensor2img(images[0].detach()[i].cpu()/255), cfg.root_path+ '/'+cfg.test_output_dir +'/'  + str(epoch)+'_' + f'{file_name[:-5]}.png')
                     
                 val_iou /= len(val_dataloader)
                 val_dice /= len(val_dice)
@@ -546,7 +566,7 @@ def main():
                         break
 
             # Save periodic checkpoint
-            if epoch % 20 == 0:
+            if epoch % 10 == 0:
                 torch.save({
                     "epoch": epoch,
                     "model": sam.mask_decoder.state_dict(),
@@ -573,9 +593,25 @@ def main():
                 image_embeddings = sam.image_encoder(images)
                 logits = sam.mask_decoder(image_embeddings)
                 preds = logits.argmax(dim=1)  # (H, W) class indices
-                for pred, name in zip(preds, file_name):
+                # Check if it's predicting labels (3D) or RGB (4D)
+                if logits.dim() == 4 and logits.shape[1] == 3:  # RGB prediction case (4D with 3 channels)
+                    preds = logits  # (B, 3, H, W) RGB values
+                    print('Predicting RGB values directly')
+                else:  # Label prediction case (3D)
+                    preds = logits.argmax(dim=1)  # (B, H, W) class indices
+                    print('Predicting class labels, will convert to RGB')
+        
+                ###check if it's predicting labels or rgbs
+                print('preds shape',preds.shape)
+
+                for i, (pred, name) in enumerate(zip(preds, file_name)):
                     save_path = f"{cfg.test_output_dir}/{name}.png"
-                    save_img(tensor2img(pred.detach()[i].float().cpu()), save_path)
+                    if pred.dim() == 2:  # Label prediction case (H, W)
+                    # Convert labels to RGB using label-to-color mapping
+                        rgb_pred = label_to_rgb(pred,mapping)  
+                        save_img(tensor2img(rgb_pred.float().cpu()), save_path)
+                else:  # RGB prediction case (3, H, W)
+                    save_img(tensor2img(pred.float().cpu()), save_path)
 
 if __name__ == '__main__':
     # Necessary for multiprocessing in Windows
