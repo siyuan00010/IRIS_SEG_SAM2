@@ -454,8 +454,8 @@ def main():
             for batch in train_dataloader:
                 images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                 # Adjust tensor shape to n,64,64,c
-                images = np.repeat(images,2,axis=3)
-                images = np.repeat(images,2,axis=2)
+                images = np.repeat(images,cfg.img_size//64,axis=3)
+                images = np.repeat(images,cfg.img_size//64,axis=2)
 
                 images = torch.tensor(images,dtype=torch.float32)
                 # Forward pass
@@ -497,8 +497,8 @@ def main():
                     for batch in val_dataloader:
                         images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                         # Adjust tensor shape to n,64,64,c
-                        images = np.repeat(images,2,axis=3)
-                        images = np.repeat(images,2,axis=2)
+                        images = np.repeat(images,cfg.img_size//64,axis=3)
+                        images = np.repeat(images,cfg.img_size//64,axis=2)
                         images = torch.tensor(images,dtype=torch.float32)
                         # Forward pass
                         image_embeddings = sam.image_encoder(images)
