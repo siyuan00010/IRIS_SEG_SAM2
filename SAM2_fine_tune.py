@@ -202,31 +202,26 @@ def return_dataset(image_dir, mask_dir,batch_size):
     train_dataset, val_dataset, test_dataset = split_subset(dataset)
 
     train_sample = ReturnDataset(train_dataset)
-    val_sample = ReturnDataset(val_dataset)
-    test_sample = ReturnDataset(test_dataset)
-
     train_loader = DataLoader(
         train_sample,
         batch_size=batch_size,
         shuffle=True,    # Critical for training
-        num_workers=2,
+        num_workers=2,  # 2 subprocesses
         pin_memory=True
     )
-
+    val_sample = ReturnDataset(val_dataset)
     val_loader = DataLoader(
         val_sample,
         batch_size=batch_size,
         shuffle=False,   # No need to shuffle validation
         num_workers=2
     )
-
+    test_sample = ReturnDataset(test_dataset)
     test_loader = DataLoader(
         test_sample,
         batch_size=1,    # Batch size 1 for per-image evaluation
         shuffle=False
     )
-    # print('a test loader:', test_loader.dataset[0])
-
     return train_loader, val_loader, test_loader
 
 def load_json(filename):
@@ -424,16 +419,13 @@ def main():
     batch_size = 8  # Small batch size for limited data
     images_dir = os.path.join(cfg.root_path,cfg.images_dir)
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir)
-
     train_dataloader, val_dataloader, test_dataloader = return_dataset(images_dir, masks_dir,batch_size)
    
     # Load SAM2 and freeze the encoder
     sam = sam_model_registry["vit_b"](checkpoint=f"{cfg.checkpoint_dir}/sam_vit_b_01ec64.pth")
-    predictor = SamPredictor(sam)
 
     # training
     if cfg.train:
-
         # Freeze the image encoder (no gradients)
         for param in sam.image_encoder.parameters():
             param.requires_grad = False # <--- unfreeze for >10k images
@@ -459,8 +451,8 @@ def main():
             loss = 0.0
             sam.train()
             i=0
-            for images, masks, file_name in train_dataloader:
-
+            for batch in train_dataloader:
+                images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                 # Adjust tensor shape to n,64,64,c
                 images = np.repeat(images,2,axis=3)
                 images = np.repeat(images,2,axis=2)
@@ -502,7 +494,8 @@ def main():
                 sam.eval()
                 val_iou = 0.0
                 with torch.no_grad():
-                    for images, masks, file_names in val_dataloader:
+                    for batch in val_dataloader:
+                        images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
                         # Adjust tensor shape to n,64,64,c
                         images = np.repeat(images,2,axis=3)
                         images = np.repeat(images,2,axis=2)
@@ -533,7 +526,7 @@ def main():
                 val_dice /= len(val_dice)
                 val_iou_mean = val_iou.mean()  # Compute the mean across all elements
                 val_dice_mean = val_dice.mean()  # Compute the mean across all elements            
-                print(f'epoch {epoch}/{epoch_size},\nval_IoU: {val_iou_mean.item():.2f}, val_dice: {val_dice_mean.item():.2f}')
+                print(f'epoch {epoch+1}/{epoch_size},\nval_IoU: {val_iou_mean.item():.2f}, val_dice: {val_dice_mean.item():.2f}')
                 val_iou_current=torch.nanmean(torch.tensor(val_iou)).item()
                 scheduler.step(val_iou_current)  # Adjust LR based on validation IoU
 
@@ -566,22 +559,23 @@ def main():
 
             # optimizer.load_state_dict(checkpoint["optimizer_state"])
             # start_epoch = checkpoint["epoch"] + 1  # Resume training from next epoch
-            if (cfg.test_size>0):
+    if (cfg.test_size>0):
 
-                best_model = torch.load(f"{cfg.checkpoint_dir}/best_iris_sam2.pt")
-                sam.mask_decoder.load_state_dict(best_model["model_state"])
-                optimizer.load_state_dict(best_model["optimizer_state"])
+        best_model = torch.load(f"{cfg.checkpoint_dir}/best_iris_sam2.pt")
+        sam.mask_decoder.load_state_dict(best_model["model_state"])
+        optimizer.load_state_dict(best_model["optimizer_state"])
 
-                # Evaluation
-                sam.eval()
-                with torch.no_grad():
-                    for images, masks, filenames in test_dataloader:
-                        image_embeddings = sam.image_encoder(images)
-                        logits = sam.mask_decoder(image_embeddings)
-                        preds = logits.argmax(dim=1)  # (H, W) class indices
-                        for pred, name in zip(preds, filenames):
-                            save_path = f"{cfg.test_output_dir}/{name}.png"
-                            save_img(tensor2img(pred.detach()[i].float().cpu()), save_path)
+        # Evaluation
+        sam.eval()
+        with torch.no_grad():
+            for batch in test_dataloader:
+                images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
+                image_embeddings = sam.image_encoder(images)
+                logits = sam.mask_decoder(image_embeddings)
+                preds = logits.argmax(dim=1)  # (H, W) class indices
+                for pred, name in zip(preds, file_name):
+                    save_path = f"{cfg.test_output_dir}/{name}.png"
+                    save_img(tensor2img(pred.detach()[i].float().cpu()), save_path)
 
 if __name__ == '__main__':
     # Necessary for multiprocessing in Windows
