@@ -255,20 +255,19 @@ def get_mask_mappings():
 
 def replace_with_labels(masks, mappings):
     '''
-    Args: masks: (B,C,H,W)
+    Args: masks: (B,H,W,C)
           mappings: a dict of mask labels and colors
             
-    Return: arrays with labels ((B,H,W))
+    Return: np array of masks in labels ((B,H,W))
     '''
     masks = masks.numpy()  ## convert it to numpy array
-    B,C,H,W=masks.shape
-    i=0
+    B,H,W,_=masks.shape
     segment_masks = np.zeros((B,H,W),dtype=np.uint8)
     for id,color in mappings.values():
         for b in range(B):
-            coord = np.all(masks[b].transpose(1,2,0)==color,axis=-1)
+            coord = np.all(masks[b]==color,axis=-1)
             segment_masks[b][coord]=id
-    return torch.from_numpy(segment_masks)
+    return segment_masks
 
 def generate_prompts_from_masks(segmented_mask,total_points=10):
     """Generate random label-point from masks.
@@ -295,11 +294,13 @@ def generate_prompts_from_masks(segmented_mask,total_points=10):
         if coords.shape[0] > 0:
             # Iterate through unique labels to assign proper labels to points
             for label in unique_labels:
+                print(label)
                 # Mask for the current label
                 label_mask = (segmented_mask[b] == label)
                 # Filter out the coordinates for this label
                 label_coords = coords[(label_mask[coords[:, 0], coords[:, 1]]), :]
                 label_coords_normalized = label_coords.float() / torch.tensor([H, W], device=device)
+                print(label_coords_normalized[0,0])
                 # Store coordinates and corresponding label
                 batch_points.append(label_coords_normalized)
                 batch_labels.append(torch.full((label_coords.shape[0],), label, device=device, dtype=torch.long))
@@ -313,9 +314,9 @@ def generate_prompts_from_masks(segmented_mask,total_points=10):
         else:
             # If no points found, pad with zeros (or any placeholder)
             all_coords=(torch.zeros((0, 2), device=device))
-            all_labels=(torch.full((0,), device=device, dtype=torch.long))
+            all_labels=(torch.full((0,),0, device=device, dtype=torch.long))
 
-        # If fewer points than required, pad with zeros and label -1
+       # If fewer points than required, pad with zeros and label -1
         num_points = all_coords.shape[0]
         if num_points >= total_points:
             indices = torch.randperm(num_points)[:total_points]
@@ -329,6 +330,8 @@ def generate_prompts_from_masks(segmented_mask,total_points=10):
         # scale them back to the image size (H, W)
         points_scaled = points * torch.tensor([segmented_mask.shape[1], segmented_mask.shape[2]], dtype=torch.float)
         points1.append(points_scaled)
+
+    return torch.stack(points1),torch.stack(labels1)
 
     return torch.stack(points1),torch.stack(labels1)
 def label_to_rgb(label_tensor,mapping):
@@ -356,36 +359,37 @@ def loss_function(pred, target):
     ce_loss = torch.nn.CrossEntropyLoss()(pred, target)
     dice_loss = 1 - dice_score(pred.softmax(dim=1), target)
     return ce_loss + dice_loss
-
 def dice_score(pred, target, smooth=1e-6):
-    # Ensure target is of the correct dtype and shape for one-hot encoding
-    if target.dim() == 4:  # target shape is (1, C, H, W)
-        target = target.squeeze(0)  # Now target is of shape (C, H, W)
-    num_classes = pred.shape[0]
+    # Ensure the prediction has the shape (B, C, H, W)
+    if pred.dim() == 3:
+        pred = pred.unsqueeze(0)  # If only B, H, W, add a batch dimension
 
-    pred = pred.softmax(dim=0)  # Apply softmax to get probabilities per class (C, H, W)
+    # Ensure target is in the correct shape (B, H, W)
+    if target.dim() == 4:  # If target is one-hot encoded, convert it to class indices
+        target = torch.argmax(target, dim=1)
 
-    # Ensure that target values are in the valid range [0, num_classes-1]
-    target = torch.clamp(target, min=0, max=num_classes - 1)
-    target=target.long()
-    # One-hot encode the target (target shape: (B, H, W) => (B, H, W, num_classes))
-    target_onehot = torch.nn.functional.one_hot(target, num_classes=num_classes)  # Shape: (B, H, W, num_classes)
+    num_classes = pred.shape[1]  # Number of classes
 
-    # Remove the last dimension (from (B, H, W, num_classes) to (B, num_classes, H, W))
-    target_onehot = target_onehot.permute(0, 3, 1, 2)  # Now it becomes (B, C, H, W)
-
+    # Apply softmax to get probabilities per class
+    pred = pred.softmax(dim=1)  # Pred shape: (B, C, H, W)
+    
     # Initialize Dice scores for each class
     dice_scores = np.zeros(num_classes)
+    
+    # Loop through each class
     for class_id in range(num_classes):
-        true_mask = (target == class_id)
-        pred_mask = (pred == class_id)
-        intersection = torch.sum(true_mask*pred_mask)
-        union = torch.sum(true_mask)+torch.sum(pred_mask)
+        # Create binary masks for true (target) and predicted (pred) values for this class
+        true_mask = (target == class_id).float()  # (B, H, W)
+        pred_mask = pred[:, class_id, :, :]  # (B, H, W) for class_id
 
+        # Compute intersection and union for Dice score
+        intersection = torch.sum(true_mask * pred_mask)
+        union = torch.sum(true_mask) + torch.sum(pred_mask)
+
+        # Calculate Dice score for this class
         dice_scores[class_id] = (2. * intersection + smooth) / (union + smooth)
 
     return dice_scores
-
 def IoU(pred, target, smooth=1e-6):
 
     # print("pred shape in IoU: ", pred.shape, pred[0,1,:])
@@ -404,9 +408,10 @@ def IoU(pred, target, smooth=1e-6):
             IoU_scores[class_id] = intersection.item() / (union.item() + smooth)
     return IoU_scores
 
+
 def save_img(img, img_path):
     cv2.imwrite(img_path, img)
-def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
+def tensor2img(tensor, out_type=np.uint8, min_max=(0, 255)):
     '''
     Converts a torch Tensor into an image Numpy array
     Input: 4D(B,(3/1),H,W), 3D(C,H,W), or 2D(H,W), any range, RGB channel order
@@ -415,13 +420,17 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
     tensor = tensor.squeeze().float().cpu().clamp_(*min_max)  # clamp
     tensor = (tensor - min_max[0]) / (min_max[1] - min_max[0])  # to range [0,1]
     n_dim = tensor.dim()
-    # if n_dim == 4:
-    #     n_img = len(tensor)
-    #     img_np = make_grid(tensor, nrow=int(math.sqrt(n_img)), normalize=False).numpy()
-    #     img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
-    if n_dim == 3:
+    if n_dim == 4:  # Batch of masks (B, C, H, W)
+        batch_size = tensor.shape[0]
+        rgb_imgs = []
+        for b in range(batch_size):
+            img_np = tensor[b].numpy()
+            rgb_img = np.stack([img_np[0], img_np[1], img_np[2]], axis=-1)  # (H, W, 3)
+            rgb_imgs.append(rgb_img)
+        return rgb_imgs
+    elif n_dim == 3:
         img_np = tensor.numpy()
-        img_np = np.transpose(img_np[[2, 1, 0], :, :], (1, 2, 0))  # HWC, BGR
+        img_np = np.stack([img_np[0], img_np[1], img_np[2]], axis=-1)  # HWC, BGR
     elif n_dim == 2:
         img_np = tensor.numpy()
     else:
@@ -431,7 +440,6 @@ def tensor2img(tensor, out_type=np.uint8, min_max=(0, 1)):
         img_np = (img_np * 255.0).round()
         # Important. Unlike matlab, numpy.unit8() WILL NOT round by default.
     return img_np.astype(out_type)
-
 
 def main():
     batch_size = 8  # Small batch size for limited data
@@ -464,6 +472,7 @@ def main():
         )
         mapping = get_mask_mappings()
         epoch_size = 20
+        print(f"epoch 0/{epoch_size}")
         for epoch in range(epoch_size):
             # Training phase
             loss = 0.0
@@ -475,7 +484,7 @@ def main():
                 images = np.repeat(images,cfg.img_size/64,axis=3)
                 images = np.repeat(images,cfg.img_size/64,axis=2)
 
-                images = torch.tensor(images,dtype=torch.float32)
+                images = images.clone().detach().to(torch.float32)
                 # Forward pass
                 image_embeddings = sam.image_encoder(images)
                 
@@ -507,7 +516,7 @@ def main():
                 i+=1
                 print(f'step {i}/{np.round(len(train_dataloader)/batch_size)}, loss: {loss:.4f}')
             loss += loss
-            print(f'epoch {epoch+1}/epoch_size,\nloss: {loss:.4f}')
+            print(f'epoch {epoch+1}/{epoch_size},\nloss: {loss:.4f}')
 
             # Validation phase
             if (cfg.val_size>0):
@@ -519,7 +528,7 @@ def main():
                         # Adjust tensor shape to n,64,64,c
                         images = np.repeat(images,cfg.img_size/64,axis=3)
                         images = np.repeat(images,cfg.img_size/64,axis=2)
-                        images = torch.tensor(images,dtype=torch.float32)
+                        images = images.clone().detach().to(torch.float32)
                         # Forward pass
                         image_embeddings = sam.image_encoder(images)
                         masks_label = replace_with_labels(masks,mapping)        
