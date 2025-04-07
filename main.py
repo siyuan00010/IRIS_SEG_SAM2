@@ -49,6 +49,7 @@ def main():
 
         # Loss and optimizer (only affects the decoder)
         criterion = torch.nn.CrossEntropyLoss()
+        l1_loss = nn.L1Loss()
         optimizer = torch.optim.Adam(sam.mask_decoder.parameters(), lr=1e-5) # small lr for fine tuning
 
         best_val_iou = 0.0
@@ -91,7 +92,7 @@ def main():
                                             multimask_output=True)
                 
                 masks_label = masks_label.long()
-                loss = criterion(outputs, masks_label)
+                loss = criterion(outputs, masks_label) + l1_loss(outputs, masks_label)
                 
                 # Backward pass
                 optimizer.zero_grad()

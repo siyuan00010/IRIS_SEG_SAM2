@@ -7,6 +7,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 import torch.nn.functional as F
+import torch.nn as nn
 
 class arguments:
     def __init__(self, **kwargs):
@@ -493,6 +494,11 @@ class DiceLoss(nn.Module):
         self.smooth = smooth  # Prevents division by zero
         self.num_classes = num_classes
 
+        # Class weights (background might have a smaller weight)
+        self.class_weight = torch.ones(self.num_classes)
+        self.class_weight[0] = 0.1  # Background class with smaller weight
+        self.class_weight = self.class_weight.to(torch.float32)
+
     def forward(self, logits, targets):
         """
         Args:
@@ -502,27 +508,25 @@ class DiceLoss(nn.Module):
             dice_loss: Scalar
         """
         targets = targets.long()  # Cast targets to an integer type
-        # Convert targets to one-hot (B, C, H, W)
+
+        # Convert targets to one-hot encoding (B, C, H, W)
         targets_onehot = F.one_hot(targets, self.num_classes).permute(0, 3, 1, 2).float()
 
-
+        # Apply softmax to logits to get probabilities
         probs = F.softmax(logits, dim=1)
 
-
         dice_loss = 0.0
+
+        # Calculate Dice loss for each class
         for class_idx in range(self.num_classes):
             # Intersection and Union for class_idx
             intersection = (probs[:, class_idx] * targets_onehot[:, class_idx]).sum()
             union = probs[:, class_idx].sum() + targets_onehot[:, class_idx].sum()
 
-            class_weight = torch.cat((torch.tensor([0.1]), torch.ones(16)))
-            class_weight = class_weight.to(torch.float32)
-            dice_loss += class_weight[class_idx] * (1.0 - (2.0 * intersection) / (union + self.smooth))
-            dice_loss += 1.0 - (2.0 * intersection + self.smooth) / (union + self.smooth)
-
-
+            # Compute Dice loss for the class, using class weights
+            dice_loss += self.class_weight[class_idx] * (1.0 - (2.0 * intersection) / (union + self.smooth))
+        # Return the average Dice loss over all classes
         return dice_loss / self.num_classes
-
 
 def dice_score(pred_class, target,num_classes, smooth=1e-6):
     """
