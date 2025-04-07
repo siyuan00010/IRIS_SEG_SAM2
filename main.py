@@ -39,8 +39,10 @@ def main():
     # training
     if cfg.train:
         # Freeze the image encoder (no gradients)
-        for param in sam.image_encoder.parameters():
-            param.requires_grad = False # <--- unfreeze for >10k images
+        # for param in sam.image_encoder.parameters():
+        #     param.requires_grad = False # <--- unfreeze for >10k images
+        for param in sam.image_encoder.blocks[-1].parameters():
+            param.requires_grad = True
         # Unfreeze the mask decoder (fine-tune it)
         for param in sam.mask_decoder.parameters():
             param.requires_grad = True  # <--- Only change from earlier!
