@@ -489,16 +489,16 @@ def loss_function(pred, target):
 
 
 class DiceLoss(nn.Module):
-    def __init__(self, num_classes=17, smooth=1e-6):
+    def __init__(self, num_classes=17, smooth=1e-6,class_weights=None):
         super().__init__()
         self.smooth = smooth  # Prevents division by zero
         self.num_classes = num_classes
+        self.smooth = smooth  # Prevents division by zero
+        self.num_classes = num_classes
 
-        # Class weights (background might have a smaller weight)
-        self.class_weight = torch.ones(self.num_classes)
-        self.class_weight[0] = 0.1  # Background class with smaller weight
-        self.class_weight = self.class_weight.to(torch.float32)
-
+        self.class_weight = class_weights if class_weights else torch.ones(num_classes)
+        self.alpha = 0.5
+        self.l1_loss = nn.L1Loss()
     def forward(self, logits, targets):
         """
         Args:
@@ -516,17 +516,19 @@ class DiceLoss(nn.Module):
         probs = F.softmax(logits, dim=1)
 
         dice_loss = 0.0
-
+        l1_loss=0.0
         # Calculate Dice loss for each class
         for class_idx in range(self.num_classes):
+            # print("class "+str(class_idx)+": "+str(targets_onehot[:, class_idx].sum()/(2562563)100)+"%")
             # Intersection and Union for class_idx
-            intersection = (probs[:, class_idx] * targets_onehot[:, class_idx]).sum()
+            intersection = (probs[:, class_idx]*targets_onehot[:, class_idx]).sum()
             union = probs[:, class_idx].sum() + targets_onehot[:, class_idx].sum()
-
+            l1_loss += self.class_weight[class_idx] * self.l1_loss(logits[:, class_idx], targets_onehot[:, class_idx])
             # Compute Dice loss for the class, using class weights
             dice_loss += self.class_weight[class_idx] * (1.0 - (2.0 * intersection) / (union + self.smooth))
+            combined_loss = self.alpha * (dice_loss / self.num_classes) + (1 - self.alpha) * l1_loss
         # Return the average Dice loss over all classes
-        return dice_loss / self.num_classes
+        return combined_loss
 
 def dice_score(pred_class, target,num_classes, smooth=1e-6):
     """
