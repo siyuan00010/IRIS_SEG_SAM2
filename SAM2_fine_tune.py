@@ -189,9 +189,8 @@ def return_dataset(image_dir, mask_dir,batch_size):
 
     # Read only valid images and masks
     images = [cv2.imread(path, 0) for path in valid_img_paths]  # grayscale
-    masks = [cv2.imread(path, -1) for path in valid_mask_paths]
-    print(masks[0])
-    
+    masks = [cv2.cvtColor(cv2.imread(path,1), cv2.COLOR_BGR2RGB) for path in valid_mask_paths]
+
     # Get base filenames without extension for saving predictions later
     file_names = [os.path.splitext(f)[0] for f in valid_img_files]
 
