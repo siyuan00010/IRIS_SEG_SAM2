@@ -149,7 +149,6 @@ def split_subset(dataset):
         generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
     )
     return train_subset, val_subset, test_subset
-
 # Create the datasets
 def return_dataset(image_dir, mask_dir,batch_size):
 
@@ -189,8 +188,8 @@ def return_dataset(image_dir, mask_dir,batch_size):
 
     # Read only valid images and masks
     images = [cv2.imread(path, 0) for path in valid_img_paths]  # grayscale
-    masks = [cv2.cvtColor(cv2.imread(path,1), cv2.COLOR_BGR2RGB) for path in valid_mask_paths]
-
+    masks = [cv2.imread(path,1) for path in valid_mask_paths]
+    masks = [cv2.cvtColor(mask,cv2.COLOR_BGR2RGB) for mask in masks]
     # Get base filenames without extension for saving predictions later
     file_names = [os.path.splitext(f)[0] for f in valid_img_files]
 
@@ -290,60 +289,127 @@ def load_json(filename):
         print(f"Error: The file '{filename}' is not a valid JSON file.")
         return None
 
-def get_mask_mappings():
+# def get_mask_mappings():
 
-    json_data = load_json(cfg.root_path + '/'+cfg.json_file_path)
-    keys = []
-    values = {}
+#     json_data = load_json(cfg.root_path + '/'+cfg.json_file_path)
+#     keys = []
+#     values = {}
+#     mappings = {}
+#     for key, value in json_data.items():
+#         keys.append(key)
+#         values.update(value)
+#     for key, value in values.items():
+#         keys.append(key)
+#         mappings.setdefault(value['name'],(value['id'],value['color']))
+#     # print(id_color_dict.values())
+#     cfg.num_classes = len(mappings)
+#     return mappings
+def get_mask_mappings():
+    # Load the JSON data
+    json_data = load_json(cfg.root_path + '/' + cfg.json_file_path)
+    
     mappings = {}
-    for key, value in json_data.items():
-        keys.append(key)
-        values.update(value)
-    for key, value in values.items():
-        keys.append(key)
-        mappings.setdefault(value['name'],(value['id'],value['color']))
-    # print(id_color_dict.values())
+    # Iterate through the 'labels' part of the JSON data
+    for key, value in json_data['labels'].items():
+        mappings[value['name']] = (value['id'], value['color'])  # Store the id and color for each label
+    
+    # Update the number of classes
     cfg.num_classes = len(mappings)
+    
     return mappings
 
-def label_to_rgb(pred_mask,mapping):
+# def label_to_rgb(pred_mask,mapping):
+#     """
+#     Convert a tensor of class indices to RGB colors based on a predefined color map
+#     Args:
+#         label_tensor: (H, W) tensor of class indices (int)
+#     Returns:
+#         rgb_tensor: (H, W,3) tensor of RGB values (0-255)
+#     """
+#     # Initialize RGB
+#     h, w = pred_mask.shape
+#     rgb = np.zeros((h, w, 3), dtype=np.uint8)
+#     pred_mask = pred_mask.cpu().numpy()
+#     unique_labels = np.unique(pred_mask)
+#     print(f"Unique labels in sample: {unique_labels}")
+
+#     # Map each class to its color
+#     for class_idx, color in mapping.values():
+#         mask = (pred_mask == class_idx)
+#         rgb[mask] = color 
+     
+#     return torch.from_numpy(rgb).to(torch.int8)
+def label_to_rgb(pred_mask, mapping):
     """
-    Convert a tensor of class indices to RGB colors based on a predefined color map
+    Convert a tensor of class indices to RGB colors based on a predefined color map.
     Args:
-        label_tensor: (H, W) tensor of class indices (int)
+        pred_mask: (H, W) tensor of class indices (int)
+        mapping: a dict with class ids and their corresponding RGB colors
     Returns:
-        rgb_tensor: (H, W,3) tensor of RGB values (0-255)
+        rgb_tensor: (H, W, 3) tensor of RGB values (0-255)
     """
-    # Initialize RGB
+    # Initialize RGB image with zero values (for background or NotYetLabeled)
     h, w = pred_mask.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    pred_mask = pred_mask.cpu().numpy()
+    pred_mask = pred_mask.cpu().numpy()  # Convert to numpy for processing
+    
+    # Check for unique classes in pred_mask
     unique_labels = np.unique(pred_mask)
-    print(f"Unique labels in sample: {unique_labels}")
-
-    # Map each class to its color
+    print(f"Unique labels in sample: {unique_labels}")  # Debugging: display the unique labels
+    
+    # Assign color for each class based on mapping
     for class_idx, color in mapping.values():
         mask = (pred_mask == class_idx)
-        rgb[mask] = color 
-     
-    return torch.from_numpy(rgb).to(torch.int8)
+        rgb[mask] = color  # Assign corresponding color to matching mask indices
 
+    # Handle `NotYetLabeled` pixels (class 0, treated as background) separately
+    if 0 in mapping:  # If background/NotYetLabeled is in the mapping
+        rgb[pred_mask == 0] = mapping[0][1]  # Get the color for class 0 (background or NotYetLabeled)
+    else:
+        # If `NotYetLabeled` (class 0) is not in the mapping, manually assign background color
+        rgb[pred_mask == 0] = [0, 0, 0]  # Background: black
+
+    return torch.from_numpy(rgb).to(torch.int8)  # Convert the RGB image back to tensor
+# def replace_with_labels(masks, mappings):
+#     '''
+#     Args: masks: (B,H,W,C)
+#           mappings: a dict of mask labels and colors
+            
+#     Return: np array of masks in labels ((B,H,W))
+#     '''
+#     masks = masks.numpy()  ## convert it to numpy array
+#     B,H,W,_=masks.shape
+#     segment_masks = np.zeros((B,H,W),dtype=np.int64)
+#     for id,color in mappings.values():
+#         for b in range(B):
+#             coord = np.all(masks[b]==np.array(color),axis=-1)
+#             segment_masks[b][coord]=id
+#     return segment_masks
 def replace_with_labels(masks, mappings):
     '''
-    Args: masks: (B,H,W,C)
-          mappings: a dict of mask labels and colors
-            
-    Return: np array of masks in labels ((B,H,W))
+    Args: 
+        masks: Tensor of shape (B, H, W, C), representing one-hot or RGB masks
+        mappings: A dictionary mapping class names to (id, color) pairs
+        
+    Returns:
+        A tensor of shape (B, H, W) with label-based mask values
     '''
-    masks = masks.numpy()  ## convert it to numpy array
-    B,H,W,_=masks.shape
-    segment_masks = np.zeros((B,H,W),dtype=np.int64)
-    for id,color in mappings.values():
-        for b in range(B):
-            coord = np.all(masks[b]==np.array(color),axis=-1)
-            segment_masks[b][coord]=id
+    B, H, W, C = masks.shape  # Get batch size, height, width, and channels
+    
+    # Initialize an empty tensor for the segment masks (label-based masks)
+    segment_masks = torch.zeros((B, H, W), dtype=torch.int64, device=masks.device)
+    
+    # Convert mappings to a tensor for faster color comparison
+    color_dict = torch.tensor([color for _, color in mappings.values()], device=masks.device)
+    
+    for idx, color in enumerate(color_dict):
+        # Create a mask where the color matches
+        mask = torch.all(masks == color, dim=-1)  # (B, H, W), True where the color matches
+        
+        # Assign the corresponding label id to the segment_masks
+        segment_masks[mask] = idx
+    
     return segment_masks
-
 def generate_prompts_from_masks(segmented_mask,total_points=50):
     """Generate random label-point from masks.
         Args:
@@ -419,6 +485,45 @@ def loss_function(pred, target):
     ce_loss = torch.nn.CrossEntropyLoss()(pred, target.long())
     dice_loss = 1 - dice_score(pred.softmax(dim=1), target)
     return ce_loss + dice_loss
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes=17, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth  # Prevents division by zero
+        self.num_classes = num_classes
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Model output (B, C, H, W) (raw scores, before softmax)
+            targets: Ground truth (B, H, W) with class indices (0-16)
+        Returns:
+            dice_loss: Scalar
+        """
+        targets = targets.long()  # Cast targets to an integer type
+        # Convert targets to one-hot (B, C, H, W)
+        targets_onehot = F.one_hot(targets, self.num_classes).permute(0, 3, 1, 2).float()
+
+
+        probs = F.softmax(logits, dim=1)
+
+
+        dice_loss = 0.0
+        for class_idx in range(self.num_classes):
+            # Intersection and Union for class_idx
+            intersection = (probs[:, class_idx] * targets_onehot[:, class_idx]).sum()
+            union = probs[:, class_idx].sum() + targets_onehot[:, class_idx].sum()
+
+            class_weight = torch.cat((torch.tensor([0.1]), torch.ones(16)))
+            class_weight = class_weight.to(torch.float32)
+            dice_loss += class_weight[class_idx] * (1.0 - (2.0 * intersection) / (union + self.smooth))
+            dice_loss += 1.0 - (2.0 * intersection + self.smooth) / (union + self.smooth)
+
+
+        return dice_loss / self.num_classes
+
+
 def dice_score(pred_class, target,num_classes, smooth=1e-6):
     """
     Args: 
@@ -440,23 +545,6 @@ def dice_score(pred_class, target,num_classes, smooth=1e-6):
     mean_dice = dice.mean()  # Mean over batch and class
 
     return mean_dice, dice  # [scalar], [B, C]
-
-    # # Initialize Dice scores for each class
-    # dice_scores = np.zeros(num_classes)
-    
-    # # Loop through each class
-    # for class_id in range(num_classes):
-    #     # Create binary masks for true (target) and predicted (pred) values for this class
-    #     true_mask = (target == class_id)  # (B, H, W)
-    #     # pred_mask = pred[:, class_id, :, :]  # (B, H, W) for class_id
-    #     pred_mask = (pred.argmax(dim=1) == class_id)
-
-    #     # Compute intersection and union for Dice score
-    #     intersection = torch.sum(true_mask * pred_mask)
-    #     union = torch.sum(true_mask) + torch.sum(pred_mask)
-
-    #     # Calculate Dice score for this class
-    #     dice_scores[class_id] = (2. * intersection + smooth) / (union + smooth)
 
 def IoU(pred_class, target, num_classes, smooth=1e-6):
     # print(torch.unique(pred_class))  # See what values it has
