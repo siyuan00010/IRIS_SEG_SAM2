@@ -1,5 +1,5 @@
 
-from SAM2_fine_tune import Config, replace_with_labels,return_dataset, generate_prompts_from_masks,get_mask_mappings,IoU,dice_score,label_to_rgb,save_img,tensor2img
+from SAM2_fine_tune import Config, DiceLoss,replace_with_labels,return_dataset, generate_prompts_from_masks,get_mask_mappings,IoU,dice_score,label_to_rgb,save_img,tensor2img
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,6 +10,46 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 def main():
     cfg = Config()
+    class_percentages = {
+    0: 52.1942,
+    1: 5.9224,
+    2: 0.5646,
+    3: 5.2658,
+    4: 0.2553,
+    5: 0.0,
+    6: 0.3799,
+    7: 0.0,
+    8: 0.1383,
+    9: 0.1495,
+    10: 0.0198,
+    11: 0.1139,
+    12: 0.2202,
+    13: 0.0,
+    14: 1.4033,
+    15: 0.0392,
+    16: 0.0
+}
+
+
+    class_proportions = {k: v / 100 for k, v in class_percentages.items()}
+    min_weight = 1.0
+    max_weight = 10.0  # Maximum weight to prevent runaway scaling for extremely small classes
+
+
+    weights = {}
+    for cls, proportion in class_proportions.items():
+        if proportion > 0:
+            weight = 1 / proportion  # Inverse frequency
+            # Apply the minimum and maximum weight threshold
+            weight = max(min_weight, min(weight, max_weight))
+            weights[cls] = weight
+        else:
+            weights[cls] = min_weight  # For empty classes (i.e., proportion 0), set a weight of 1 (or some other constant)
+
+
+    total_weight = sum(weights.values())
+    normalized_weights = {cls: weight / total_weight for cls, weight in weights.items()} 
+
     batch_size = 2  # Small batch size for limited data
     images_dir = os.path.join(cfg.root_path,cfg.images_dir).replace('\\','/')
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
@@ -39,14 +79,16 @@ def main():
     # training
     if cfg.train:
         # Freeze the image encoder (no gradients)
-        for param in sam.image_encoder.parameters():
-            param.requires_grad = False # <--- unfreeze for >10k images
+        # for param in sam.image_encoder.parameters():
+        #     param.requires_grad = False # <--- unfreeze for >10k images
+        for param in sam.image_encoder.blocks[-1].parameters():
+            param.requires_grad = True
         # Unfreeze the mask decoder (fine-tune it)
         for param in sam.mask_decoder.parameters():
             param.requires_grad = True  # <--- Only change from earlier!
 
         # Loss and optimizer (only affects the decoder)
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = DiceLoss(normalized_weights)
         optimizer = torch.optim.Adam(sam.mask_decoder.parameters(), lr=1e-5) # small lr for fine tuning
 
         best_val_iou = 0.0
