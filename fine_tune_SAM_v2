@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 import json
 from PIL import Image
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 import torch.nn.functional as F
@@ -38,8 +39,8 @@ class Config(object):
         checkpoint_dir='C:/path/to/new/virtual/environment/IRIS_SEG_SAM2',
         # output_dir="/home/wvubiometrics/Documents/Molly/IRIS_SEG_SAM2/SAM2_output",
         # test_output_dir="/home/wvubiometrics/Documents/Molly/IRIS_SEG_SAM2/SAM2_test_pred",
-        output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/output",
-        test_output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_new_test",
+        output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_new_test",
+        test_output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_pred",
         test_size=0.15,
         val_size=0.15,
         print_images=True,
@@ -162,9 +163,6 @@ def return_dataset(image_dir, mask_dir,batch_size):
     img_paths = [os.path.join(image_dir, f).replace('\\','/') for f in img_files]
     mask_paths = [os.path.join(mask_dir, f).replace('\\','/') for f in mask_files]
 
-    # img_paths = img_paths[:40]
-    # mask_paths = mask_paths[:40]
-
     # Validate images and keep track of valid files
     valid_img_files = []
     valid_img_paths = []
@@ -260,7 +258,7 @@ def save_img(img, img_path,upscale=4):
         img (np.ndarray): Image in HWC (RGB) or HW format.
         img_path (str): Path to save image.
     """
-    print(f"Saving image to {img_path}, shape: {img.shape}, dtype: {img.dtype}")
+    # print(f"Saving image to {img_path}, shape: {img.shape}, dtype: {img.dtype}")
     
     if img.ndim == 3:
         if img.shape[2] == 3:
@@ -275,6 +273,54 @@ def save_img(img, img_path,upscale=4):
     elif img.ndim != 2:
         raise ValueError(f"Unsupported image shape: {img.shape}")
     # cv2.imwrite(img_path, img)
+
+def compute_iou_dice_per_class(pred_class, target, num_classes=17, smooth=1e-6):
+    if target.ndim == 4 and target.shape[1] == 1:
+        target = target.squeeze(1)  # [B, 1, H, W] → [B, H, W]
+
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
+    target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+
+    intersection = (pred_onehot * target_onehot).sum(dim=(0, 2, 3))
+    union = pred_onehot.sum(dim=(0, 2, 3)) + target_onehot.sum(dim=(0, 2, 3)) - intersection
+    dice_denominator = pred_onehot.sum(dim=(0, 2, 3)) + target_onehot.sum(dim=(0, 2, 3))
+
+    iou = (intersection + smooth) / (union + smooth)
+    dice = (2 * intersection + smooth) / (dice_denominator + smooth)
+
+    return iou.cpu().numpy(), dice.cpu().numpy()
+
+
+def plot_per_class_iou_dice(pred_class, target, epoch, file_name, class_names=None):
+    num_classes = pred_class.max().item() + 1 if class_names is None else len(class_names)
+    iou, dice = compute_iou_dice_per_class(pred_class, target, num_classes=num_classes)
+
+    # Remove classes not in GT (where target is all zero)
+    target_counts = torch.bincount(target.view(-1), minlength=num_classes)
+    valid_class_indices = (target_counts > 0).nonzero(as_tuple=True)[0]
+
+    iou = iou[valid_class_indices]
+    dice = dice[valid_class_indices]
+
+    labels = [f"Class {i}" if class_names is None else class_names[i] for i in valid_class_indices]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(x - width/2, iou, width, label='IoU')
+    ax.bar(x + width/2, dice, width, label='Dice')
+
+    ax.set_ylabel('Score')
+    ax.set_title('Per-class IoU and Dice')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45)
+    ax.set_ylim(0, 1)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(f'{cfg.output_dir}/{epoch}_{file_name}.png')
+    plt.close()
+
 
 def load_json(filename):
     """Reads a JSON file and returns the data as a dictionary."""
@@ -418,6 +464,37 @@ def generate_prompts_from_masks(segmented_mask,total_points=50):
     points1.append(points_scaled.to(torch.int32))
     return torch.stack(points1),torch.stack(labels1)
 
+def patch_dice_score(pred_class, target, num_classes, n_splits=4, smooth=1e-6):
+    """
+    Computes average Dice score over patches.
+    Both pred_class and target are shape [B, H, W]
+    """
+    B, H, W = pred_class.shape
+    h_step = H // n_splits
+    w_step = W // n_splits
+
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
+    target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+
+    patch_dice_total = 0.0
+    count = 0
+
+    for i in range(n_splits):
+        for j in range(n_splits):
+            h_start, h_end = i * h_step, (i + 1) * h_step
+            w_start, w_end = j * w_step, (j + 1) * w_step
+
+            pred_patch = pred_onehot[:, 1:, h_start:h_end, w_start:w_end]
+            target_patch = target_onehot[:, 1:, h_start:h_end, w_start:w_end]
+
+            inter = (pred_patch * target_patch).sum(dim=(2, 3))
+            union = pred_patch.sum(dim=(2, 3)) + target_patch.sum(dim=(2, 3))
+
+            dice = (2 * inter + smooth) / (union + smooth)
+            patch_dice_total += dice.mean()
+            count += 1
+
+    return patch_dice_total / count
 
 # Loss functions
 def loss_function(pred, target):
@@ -427,6 +504,23 @@ def loss_function(pred, target):
     dice_loss = 1 - dice_score(pred.softmax(dim=1), target)
     return ce_loss + dice_loss
 
+def safe_argmax(logits: torch.Tensor, target_size: tuple, mode='bilinear', align_corners=False) -> torch.Tensor:
+    """
+    Resize logits if needed, then return argmax over class dim.
+
+    Args:
+        logits: Tensor of shape [B, C, H_pred, W_pred]
+        target_size: Target spatial size (H_target, W_target)
+        mode: interpolation mode (default: bilinear)
+        align_corners: align_corners for interpolation
+
+    Returns:
+        pred_class: Tensor of shape [B, H_target, W_target], with class indices
+    """
+    if logits.shape[-2:] != target_size:
+        logits = F.interpolate(logits, size=target_size, mode=mode, align_corners=align_corners)
+    
+    return torch.argmax(logits, dim=1)
 
 class DiceLoss(nn.Module):
     def __init__(self, num_classes=17, smooth=1e-6,class_weights=None):
@@ -465,6 +559,57 @@ class DiceLoss(nn.Module):
         # Return the average Dice loss over all classes
         return combined_loss.mean()
 
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+
+class SegmentationLoss(nn.Module):
+    def __init__(self, num_classes, class_weights, dice_weight=0.5, iou_weight=0.5, ce_weight=1.0, l1_weight=0.1, smooth=1):
+        super(SegmentationLoss, self).__init__()
+        self.num_classes = num_classes
+        self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+        self.l1_loss = nn.L1Loss()
+        self.dice_weight = dice_weight
+        self.iou_weight = iou_weight
+        self.ce_weight = ce_weight
+        self.l1_weight = l1_weight
+        self.smooth = smooth
+
+    def forward(self, pred_logits, target):
+    # pred_logits: [B, C, H, W]
+    # target: [B, H, W] class indices
+        probabilities = torch.softmax(pred_logits, dim=1)
+        pred_class = torch.argmax(probabilities, dim=1)  # [B, H, W]
+        print("Unique predicted classes:", torch.unique(pred_class))
+
+        dice_mean, _ = dice_score(pred_class, target, num_classes=self.num_classes)
+        iou_mean, iou_per_class = IoU(pred_class, target, num_classes=self.num_classes)
+        print("IoU per class:", iou_per_class.cpu().detach().numpy())
+
+
+        dice_loss = 1 - dice_mean
+        iou_loss = 1 - iou_mean.mean()
+
+        # Local patch-level dice
+        patch_dice = patch_dice_score(pred_class, target, num_classes=self.num_classes)
+        patch_dice_loss = 1 - patch_dice
+
+        # L1 loss
+        target_indices = torch.argmax(target, dim=1) if target.ndim == 4 else target
+        pred_probs = F.softmax(pred_logits, dim=1)
+        l1 = self.l1_loss(pred_probs, F.one_hot(target_indices, self.num_classes).permute(0, 3, 1, 2).float())
+        entropy = -torch.sum(pred_probs * torch.log(pred_probs + 1e-8), dim=1).mean()
+
+
+        total_loss = (
+            self.dice_weight * dice_loss +
+            self.iou_weight * iou_loss +
+            self.l1_weight * l1 +
+            1.0 * patch_dice_loss
+        )
+        total_loss += 0.1 * entropy
+
+        return total_loss
 
 def dice_score(pred_class, target,num_classes, smooth=1e-6):
     """
@@ -488,7 +633,6 @@ def dice_score(pred_class, target,num_classes, smooth=1e-6):
  
 
 def IoU(pred_class, target, num_classes, smooth=1e-6):
-    print(pred_class.shape, target.shape)
     pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
     target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     
@@ -499,48 +643,76 @@ def IoU(pred_class, target, num_classes, smooth=1e-6):
     mean_iou = iou.mean(dim=1)
     return mean_iou, iou
 
-class_percentages = {
-    0: 52.1942,
-    1: 5.9224,
-    2: 0.5646,
-    3: 5.2658,
-    4: 0.2553,
-    5: 0.0,
-    6: 0.3799,
-    7: 0.0,
-    8: 0.1383,
-    9: 0.1495,
-    10: 0.0198,
-    11: 0.1139,
-    12: 0.2202,
-    13: 0.0,
-    14: 1.4033,
-    15: 0.0392,
-    16: 0.0
-}
+def get_class_weights(class_percentages: dict, num_classes: int = 17,
+                      min_weight: float = 1.0, max_weight: float = 10.0,
+                      background_class: int = 0, background_weight: float = 0.2) -> torch.Tensor:
+    """
+    Generate normalized class weights with inverse-frequency scaling.
+    
+    Args:
+        class_percentages: Dict mapping class index to percentage (0–100)
+        num_classes: Total number of classes
+        min_weight: Minimum allowed weight
+        max_weight: Maximum allowed weight
+        background_class: Index of background class (usually 0)
+        background_weight: Weight to manually set for background class
+        
+    Returns:
+        torch.Tensor of shape [num_classes]
+    """
+    # Convert percentages to proportions
+    proportions = {k: v / 100 for k, v in class_percentages.items()}
 
-# Convert percentages to proportions (i.e., divide by 100)
-class_proportions = {k: v / 100 for k, v in class_percentages.items()}
-min_weight = 1.0
-max_weight = 10.0  # Maximum weight to prevent runaway scaling for extremely small classes
+    # Compute inverse weights
+    weights = []
+    for cls in range(num_classes):
+        prop = proportions.get(cls, 0.0)
+        if prop > 0:
+            w = 1.0 / prop
+            w = max(min_weight, min(w, max_weight))
+        else:
+            w = 0.0 
 
-# Calculate the weights
-weights = {}
-for cls, proportion in class_proportions.items():
-    if proportion > 0:
-        weight = 1 / proportion  # Inverse frequency
-        # Apply the minimum and maximum weight threshold
-        weight = max(min_weight, min(weight, max_weight))
-        weights[cls] = weight
-    else:
-        weights[cls] = min_weight  # For empty classes (i.e., proportion 0), set a weight of 1 (or some other constant)
+        weights.append(w)
 
-# Normalize the weights
-total_weight = sum(weights.values())
-normalized_weights = {cls: weight / total_weight for cls, weight in weights.items()}
+    # Normalize weights
+    total = sum(weights)
+    normalized_weights = [w / total for w in weights]
+
+    # Manually override background class
+    normalized_weights[background_class] = background_weight
+
+    # Re-normalize again after background adjustment
+    total_after_bg = sum(normalized_weights)
+    final_weights = [w / total_after_bg for w in normalized_weights]
+
+    return torch.tensor(final_weights, dtype=torch.float32)
+
+
 
 def main():
     cfg = Config()
+    
+    class_percentages = {
+        0: 52.1942,
+        1: 5.9224,
+        2: 0.5646,
+        3: 5.2658,
+        4: 0.2553,
+        5: 0.0,
+        6: 0.3799,
+        7: 0.0,
+        8: 0.1383,
+        9: 0.1495,
+        10: 0.0198,
+        11: 0.1139,
+        12: 0.2202,
+        13: 0.0,
+        14: 1.4033,
+        15: 0.0392,
+        16: 0.0
+    }
+    weight_tensor = get_class_weights(class_percentages, num_classes=17)
     batch_size = 8  # Small batch size for limited data
     images_dir = os.path.join(cfg.root_path,cfg.images_dir).replace('\\','/')
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
@@ -561,6 +733,9 @@ def main():
 
     # Adjust the mask_tokens and IOU head to match the number of classes (17)
     sam.mask_decoder.mask_tokens = nn.Embedding(cfg.num_classes, cfg.img_size)  # Change to 17 tokens
+    nn.init.normal_(sam.mask_decoder.mask_tokens.weight, mean=0.0, std=0.01)
+    nn.init.xavier_uniform_(sam.mask_decoder.mask_tokens.weight)
+
     sam.mask_decoder.iou_prediction_head =  nn.Sequential(
                                             nn.Linear(cfg.img_size, cfg.img_size),
                                             nn.ReLU(),
@@ -573,7 +748,7 @@ def main():
         for param in sam.image_encoder.parameters():
             param.requires_grad = False # <--- unfreeze for >10k images
         # Unfreeze the last 5 layers (starting from the last one)
-        for i, layer in enumerate(list(sam.image_encoder.children())[-1:]):
+        for i, layer in enumerate(list(sam.image_encoder.children())[-5:]):
             for param in layer.parameters():
                 param.requires_grad = True
         # Unfreeze the mask decoder (fine-tune it)
@@ -582,10 +757,22 @@ def main():
 
         # Loss and optimizer (only affects the decoder)
         # criterion = torch.nn.CrossEntropyLoss()
-        criterion = DiceLoss(class_weights=normalized_weights) 
-
-        optimizer = torch.optim.Adam(list(sam.image_encoder.parameters()) + list(sam.mask_decoder.parameters()), lr=1e-4) # small lr for fine tuning
-
+        # criterion = DiceLoss(class_weights=normalized_weights) 
+        criterion = SegmentationLoss(
+                            num_classes=17,
+                            class_weights=weight_tensor.to(cfg.device),  # Optional: provide a tensor of shape [17]
+                            dice_weight=1.0,
+                            iou_weight=0.5,
+                            ce_weight=1.0,
+                            l1_weight= 0.1
+                        )
+        # optimizer = torch.optim.Adam(list(sam.image_encoder.parameters()) + list(sam.mask_decoder.parameters()), lr=1e-5) # small lr for fine tuning
+        decoder_params = list(sam.mask_decoder.parameters())
+        encoder_params = [p for p in sam.image_encoder.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam([
+                            {'params': encoder_params, 'lr': 1e-5},
+                            {'params': decoder_params, 'lr': 5e-5}
+                            ])
         best_val_iou = 0.0
         patience = 50  # Stop if no improvement for 10 epochs
         epochs_without_improvement = 0
@@ -594,19 +781,17 @@ def main():
             optimizer, mode="max", factor=0.5, patience=50, verbose=True
         )
         mapping = get_mask_mappings()
-        epoch_size = 50
+        epoch_size = 100
         print(f"epoch 0/{epoch_size}")
 
         for epoch in range(epoch_size):
             # Training phase
-            loss = 0.0
+            loss_total = 0.0
             sam.train()
             i=0
             for batch in train_dataloader:
                 
-                images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
-                # Adjust tensor shape to n,64,64,c
-                
+                images, masks, file_name = batch['image'],batch['mask'],batch['file_name'] 
                 import torchvision.transforms.functional as F
 
                 # Apply transformations directly on tensors
@@ -618,36 +803,38 @@ def main():
                 masks_label = replace_with_labels(masks,mapping)     
                 masks_label = masks_label.to(torch.long)
 
-                points,labels = generate_prompts_from_masks(masks_label,total_points=49)
+                points,labels = generate_prompts_from_masks(masks_label,total_points=170)
                 masks_label = masks_label.unsqueeze(1)
                 sparse_embeddings, dense_embeddings = sam.prompt_encoder(
-                    points=(points, labels),
+                    points=None,
                     boxes=None,
                     masks=masks_label.clone().detach().to(torch.float32)
                 )
+                masks_label = masks_label.squeeze(1)
 
                 outputs,_ = sam.mask_decoder(image_embeddings=image_embeddings,
                                             image_pe=sam.prompt_encoder.get_dense_pe(),
                                             sparse_prompt_embeddings=sparse_embeddings,
                                             dense_prompt_embeddings=dense_embeddings,
                                             multimask_output=True)
-                # print(raw_logits.shape)##[B,C,H,W]
-                num_classes = outputs.shape[1]
-                # Apply softmax to convert logits to probabilities for each class
-                probabilities = torch.softmax(outputs, dim=1)
-                # Convert to predicted class by taking argmax along the class dimension
-                pred_class = torch.argmax(probabilities, dim=1) ### [B,H,W]    
+                # # print(raw_logits.shape)##[B,C,H,W]# Resize logits before passing to loss
+                if outputs.shape[-2:] != masks_label.shape[-2:]:
+                    outputs = F.interpolate(outputs, size=masks_label.shape[-2:], mode='bilinear', align_corners=False)
 
-                masks_label = masks_label.long()
+                # Pass raw logits into loss
                 loss = criterion(outputs, masks_label)
-                # loss=1-mean_dice
+
+                # Get prediction for IoU/Dice etc
+                pred_class = torch.argmax(outputs, dim=1)  # or safe_argmax(outputs, masks_label.shape[-2:])
+
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                loss_total += loss.item()
                 i+=1
                 print(f'step {i}/{np.round(len(train_dataloader.dataset)/batch_size).astype(int)}, loss: {loss:.3f}')
-            loss += loss
+            
             print(f'epoch {epoch+1}/{epoch_size}, loss: {loss:.3f}')
 
             # Validation phase
@@ -658,9 +845,11 @@ def main():
                 with torch.no_grad():
                     for batch in val_dataloader:
                         images, masks, file_name = batch['image'],batch['mask'],batch['file_name']
-                        # Adjust tensor shape to n,64,64,c
-                        img = np.repeat(images,cfg.img_size/64,axis=3)
-                        img = np.repeat(img,cfg.img_size/64,axis=2)
+                        # # Adjust tensor shape to n,64,64,c
+                        # img = np.repeat(images,cfg.img_size/64,axis=3)
+                        # img = np.repeat(img,cfg.img_size/64,axis=2)
+                        img = F.resize(images, [int(cfg.img_size/16), int(cfg.img_size/16)])
+
 
                         img = img.clone().detach().to(torch.float32)
                         # Forward pass
@@ -669,13 +858,14 @@ def main():
                         masks_label = replace_with_labels(masks,mapping)  
                         masks_label = masks_label.to(torch.long)
                         
-                        points,labels = generate_prompts_from_masks(masks_label,total_points=49)
+                        points,labels = generate_prompts_from_masks(masks_label,total_points=34)
                         masks_label = masks_label.unsqueeze(1)
                         sparse_embeddings, dense_embeddings = sam.prompt_encoder(
                             points = (points,labels),
                             boxes = None,
                             masks = masks_label.clone().detach().to(torch.float32)
                         )
+                        masks_label = masks_label.squeeze(1)
 
                         raw_logits,_ = sam.mask_decoder(image_embeddings=image_embeddings,
                                                     image_pe=sam.prompt_encoder.get_dense_pe(),
@@ -684,12 +874,11 @@ def main():
                                                     multimask_output=True)
                         # print(raw_logits.shape)##[B,C,H,W]
                         num_classes = raw_logits.shape[1]
-                        # Apply softmax to convert logits to probabilities for each class
-                        probabilities = torch.softmax(raw_logits, dim=1)
-                        # Convert to predicted class by taking argmax along the class dimension
-                        pred_class = torch.argmax(probabilities, dim=1) ### [B,H,W]
-                        print(torch.max(pred_class))
-                        masks_label = masks_label.squeeze(1)
+                        # # Apply softmax to convert logits to probabilities for each class
+                        # probabilities = torch.softmax(raw_logits, dim=1)
+                        pred_class = safe_argmax(raw_logits, masks_label.shape[-2:])
+                        # # Convert to predicted class by taking argmax along the class dimension
+                        # pred_class = torch.argmax(probabilities, dim=1) ### [B,H,W]
                         # Compute IoU for each class by comparing the predicted class and ground truth class
                         mean_iou, _ = IoU(pred_class,masks_label,num_classes)
                         val_iou += mean_iou
@@ -697,14 +886,15 @@ def main():
                         val_dice += mean_dice
                         os.makedirs(cfg.test_output_dir +'/' , exist_ok=True)
 
-                        for b in range(pred_class.shape[0]):
+                        for b in range(pred_class.shape[0]): 
+                            plot_per_class_iou_dice(pred_class[0], masks_label, epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
+                        
+                            Image.fromarray(pred_class[0].cpu().numpy().astype(np.uint8)).save(f"{cfg.test_output_dir}_2/{file_name[b]}_{epoch}pred_class.png")
                             
                             outputs = label_to_rgb(pred_class[b],mapping)
                             image = images[b].permute(1, 2, 0).cpu().numpy()
                             output_img = tensor2img(outputs)
-                            print(output_img.shape)
                             mask_img = tensor2img(masks[b])
-
 
                             save_img(output_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_pred.png")
                             save_img(image, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}.png")
@@ -715,7 +905,8 @@ def main():
                 val_dice_mean = val_dice.mean()  # Compute the mean across all elements            
                 print(f' val_IoU: {val_iou_mean.item():.2f}, val_dice: {val_dice_mean.item():.2f}')
                 current_val_iou=torch.nanmean(val_iou.clone().detach()).item()
-                scheduler.step(current_val_iou)  # Adjust LR based on validation IoU
+                if current_val_iou > 1e-3:
+                    scheduler.step(current_val_iou)
 
                 # Check validation IoU
                 best_val_iou = val_iou_mean.cpu().numpy()
