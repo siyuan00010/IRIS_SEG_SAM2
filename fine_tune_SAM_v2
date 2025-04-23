@@ -786,7 +786,6 @@ def main():
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
     train_dataloader, val_dataloader, test_dataloader = return_dataset(images_dir, masks_dir,batch_size)
 
-    # # Load SAM2 and freeze the encoder
     # Load the checkpoint state_dict
     model_state_dict = torch.load(f"{cfg.checkpoint_dir}/sam_vit_b_01ec64.pth", weights_only=True)
 
@@ -1002,7 +1001,7 @@ def main():
                     best_val_iou = current_val_iou
                     epochs_without_improvement = 0
                     # best iou checkpoint
-                    torch.save(sam.mask_decoder.state_dict(), f"{cfg.checkpoint_dir}/best_iris_sam2.pth")
+                    torch.save(sam.state_dict(), f"{cfg.checkpoint_dir}/best_iris_sam2.pth")
                     print(f"Saved best model at epoch {epoch} with IoU {val_iou:.4f}")
                 
                 else:
@@ -1015,7 +1014,7 @@ def main():
             if epoch % 100 == 0:
                 torch.save({
                     "epoch": epoch,
-                    "model": sam.mask_decoder.state_dict(),
+                    "model": sam.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "loss":loss,
                 }, f"{cfg.checkpoint_dir}/epoch_{epoch}.pth")
