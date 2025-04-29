@@ -424,7 +424,7 @@ def log_metrics(iou_per_class, mean_iou, mean_dice, epoch,loss_value, class_name
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     with open(log_file, "a") as f:
         f.write(log_string)
-        
+
 def plot_iou_curve(log_txt_path, output_dir="./", class_names=None):
     """
     Plots per-class IoU curve over epochs from a metrics log file.
@@ -481,6 +481,44 @@ def plot_iou_curve(log_txt_path, output_dir="./", class_names=None):
     plt.close()
     print(f" Saved IoU curve to {save_path}")
 
+def save_metrics_curves(metrics: dict, output_dir="./", filename="training_metrics.png"):
+    """
+    Plots and saves training metrics curves over epochs.
+
+    Args:
+        metrics: Dict of {metric_name: list of values}, e.g., {'Loss': [...], 'IoU': [...], 'Dice': [...]}
+        output_dir: Directory to save the figure
+        filename: Filename to save (should end with .png)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not filename.endswith(".png"):
+        filename += ".png"
+
+    # Assume all metric lists have the same length
+    num_epochs = len(next(iter(metrics.values())))
+    epochs = np.arange(1, num_epochs + 1)
+
+    plt.figure(figsize=(10, 6))
+
+    markers = ['o', 's', '^', 'd', 'x']
+    colors = ['blue', 'green', 'red', 'purple', 'orange']
+
+    for idx, (name, values) in enumerate(metrics.items()):
+        plt.plot(epochs, values, label=name, marker=markers[idx % len(markers)], color=colors[idx % len(colors)])
+
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('Metric Value', fontsize=14)
+    plt.title('Training Metrics Over Epochs', fontsize=16)
+    plt.grid(True)
+    plt.legend(fontsize=12)
+    plt.tight_layout()
+
+    save_path = os.path.join(output_dir, filename)
+    plt.savefig(save_path)
+    plt.close()
+    print(f" Saved training metrics curve to {save_path}")
+    
 def load_json(filename):
     """Reads a JSON file and returns the data as a dictionary."""
     try:
