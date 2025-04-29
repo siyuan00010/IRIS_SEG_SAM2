@@ -424,7 +424,62 @@ def log_metrics(iou_per_class, mean_iou, mean_dice, epoch,loss_value, class_name
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     with open(log_file, "a") as f:
         f.write(log_string)
+        
+def plot_iou_curve(log_txt_path, output_dir="./", class_names=None):
+    """
+    Plots per-class IoU curve over epochs from a metrics log file.
 
+    Args:
+        log_txt_path: Path to your 'metrics_log.txt'
+        output_dir: Where to save the figure
+        class_names: List of class names, if None, use 'Class 0', 'Class 1', etc.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Containers
+    epochs = []
+    iou_per_classes = []
+
+    # Read log file
+    with open(log_txt_path, 'r') as f:
+        lines = f.readlines()
+
+    # Each block is typically 3 lines: info, per-class IoU, separator
+    for i in range(0, len(lines), 3):
+        epoch_line = lines[i]
+        iou_line = lines[i+1]
+
+        # Extract epoch number
+        epoch_info = re.findall(r"[-+]?\d*\.\d+|\d+", epoch_line)
+        epoch = int(epoch_info[0])
+        epochs.append(epoch)
+
+        # Extract per-class IoU values
+        class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+        class_iou = list(map(float, class_iou))
+        iou_per_classes.append(class_iou)
+
+    # Convert to [num_classes, num_epochs]
+    iou_per_classes = list(zip(*iou_per_classes))  # transpose to [class, epoch]
+
+    # Plotting
+    plt.figure(figsize=(12, 8))
+    for idx, iou_scores in enumerate(iou_per_classes):
+        label = class_names[idx] if class_names and idx < len(class_names) else f"Class {idx}"
+        plt.plot(epochs, iou_scores, label=label, marker='o', markersize=4)
+
+    plt.xlabel("Epoch", fontsize=14)
+    plt.ylabel("IoU", fontsize=14)
+    plt.title("Per-Class IoU Curve", fontsize=16)
+    plt.ylim(0, 1.0)
+    plt.grid(True)
+    plt.legend(fontsize=10, ncol=2, bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout()
+
+    save_path = os.path.join(output_dir, "iou_curve.png")
+    plt.savefig(save_path)
+    plt.close()
+    print(f" Saved IoU curve to {save_path}")
 
 def load_json(filename):
     """Reads a JSON file and returns the data as a dictionary."""
@@ -1170,19 +1225,19 @@ def main():
 
                         if val_iou.mean() > 0.3:
 
-                        for b in range(pred_class.shape[0]): 
-                            plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
-                            
-                            # Image.fromarray(pred_class[b].cpu().numpy().astype(np.uint8)).save(f"{cfg.test_output_dir}/{file_name[b]}_{epoch}pred_class.png")
-                            
-                            outputs = label_to_rgb(pred_class[b],mapping)
-                            image = images[b].permute(1, 2, 0).cpu().numpy()
-                            output_img = tensor2img(outputs)
-                            mask_img = tensor2img(masks[b])
+                            for b in range(pred_class.shape[0]): 
+                                plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
+                                
+                                # Image.fromarray(pred_class[b].cpu().numpy().astype(np.uint8)).save(f"{cfg.test_output_dir}/{file_name[b]}_{epoch}pred_class.png")
+                                
+                                outputs = label_to_rgb(pred_class[b],mapping)
+                                image = images[b].permute(1, 2, 0).cpu().numpy()
+                                output_img = tensor2img(outputs)
+                                mask_img = tensor2img(masks[b])
 
-                            save_img(image, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}.png")
-                            save_img(output_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_pred.png")
-                            save_img(mask_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_Mask.png")
+                                save_img(image, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}.png")
+                                save_img(output_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_pred.png")
+                                save_img(mask_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_Mask.png")
                 val_iou /= len(val_dataloader.dataset)
                 val_dice /= len(val_dataloader.dataset)
                 val_iou_mean = val_iou.mean()  # Compute the mean across all elements
