@@ -342,9 +342,10 @@ def plot_per_class_iou_dice(pred_class, target, epoch, file_name, output_dir = c
     plt.savefig(f'{output_dir}/{epoch}_{file_name}.png')
     plt.close()
 
-def plot_iou_curve(log_txt, output_dir, class_names=None):
+def plot_loss_iou_curve(log_txt, output_dir, class_names=None):
     # Initialize containers
     epochs = []
+    losses = []
     dices = []
     mean_ious = []
     iou_per_classes = []
@@ -356,117 +357,74 @@ def plot_iou_curve(log_txt, output_dir, class_names=None):
     for i in range(0, len(lines), 3):  # Each block is 3 lines (Epoch line, IoU line, separator)
         epoch_line = lines[i]
         iou_line = lines[i+1]
-
-        # Extract epoch, dice, mean IoU
-        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", epoch_line)
-        if len(numbers) < 4:
-            print(f"[Warning] Skipping line {i} because it does not have enough information.")
-            continue
-        epoch = int(numbers[0])
-        dice = float(numbers[1])
-        mean_iou = float(numbers[2])
+        
+        # Extract epoch, loss, dice, mean IoU
+        epoch_info = re.findall(r"[-+]?\d*\.\d+|\d+", epoch_line)  # extracts all numbers
+        epoch = int(epoch_info[0])
+        loss = float(epoch_info[1])
+        dice = float(epoch_info[2])
+        mean_iou = float(epoch_info[3])
 
         # Extract IoU per class
-        class_iou = list(map(float, re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)))
+        class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+        class_iou = list(map(float, class_iou))
 
         # Append to lists
         epochs.append(epoch)
+        losses.append(loss)
         dices.append(dice)
         mean_ious.append(mean_iou)
         iou_per_classes.append(class_iou)
+    
+    # Convert iou_per_classes to shape [num_epochs, num_classes]
+    iou_per_classes = list(zip(*iou_per_classes))  # transpose
 
-    # Transpose iou_per_classes: [num_classes, num_epochs]
-    iou_per_classes = list(zip(*iou_per_classes))
-
-    # Create output dir
+    # --- Plot Loss Curve ---
+    plt.figure(figsize=(8,6))
+    plt.plot(epochs, losses, label="Loss", color='red')
+    plt.plot(epochs, dices, label="Dice Score", color='blue')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss / Dice')
+    plt.title('Loss and Dice Curve')
+    plt.legend()
+    plt.grid()
     os.makedirs(output_dir, exist_ok=True)
-
-    # --- Plot Dice and Mean IoU ---
-    plt.figure(figsize=(10, 6))
-    plt.plot(epochs, dices, label='Dice', marker='s', color='green')
-    plt.plot(epochs, mean_ious, label='Mean IoU', marker='^', color='blue')
-
-    plt.xlabel('Epoch', fontsize=14)
-    plt.ylabel('Metric Value', fontsize=14)
-    plt.title('Dice and Mean IoU over Epochs', fontsize=16)
-    plt.grid(True)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "dice_mean_iou_curve.png"))
+    plt.savefig(os.path.join(output_dir, 'loss_curve.png'))
     plt.close()
-    print(f"Saved Dice/Mean IoU curve to {output_dir}/dice_mean_iou_curve.png")
 
     # --- Plot IoU Curve per Class ---
-    plt.figure(figsize=(12, 8))
+    plt.figure(figsize=(10,8))
     for idx, iou_scores in enumerate(iou_per_classes):
         label = class_names[idx] if class_names and idx < len(class_names) else f'Class {idx}'
-        plt.plot(epochs, iou_scores, label=label, marker='o')
-    plt.xlabel('Epoch', fontsize=14)
-    plt.ylabel('IoU', fontsize=14)
-    plt.title('Per-Class IoU over Epochs', fontsize=16)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-    plt.grid(True)
+        plt.plot(epochs, iou_scores, label=label)
+
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU Score')
+    plt.title('IoU Curve per Class')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid()
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "per_class_iou_curve.png"))
+    plt.savefig(os.path.join(output_dir, 'iou_per_class.png'))
     plt.close()
-    print(f"Saved per-class IoU curve to {output_dir}/per_class_iou_curve.png")
 
-def save_metrics_curves(metrics: dict, output_dir="./", filename="training_curve.png"):
-    """
-    Plots and saves training metrics curves over epochs.
+    print(f"Saved loss curve and IoU curve plots to {output_dir}")
 
-    Args:
-        metrics: Dict of {metric_name: list of values}, e.g., {'Loss': [...], 'IoU': [...], 'Dice': [...]}
-        output_dir: Directory to save the figure
-        filename: Filename to save (should end with .png)
-    """ 
-    os.makedirs(output_dir, exist_ok=True)
-    
-    if not filename.endswith(".png"):
-        filename += ".png"
-
-    epochs = np.arange(1, len(next(iter(metrics.values()))) + 1)  # assume all lists are same length
-    print(epochs)
-
-    plt.figure(figsize=(10, 6))
-    colors = ['blue', 'green', 'red']
-    markers = ['o', 's', '^']
-    
-    for idx, (name, values) in enumerate(metrics.items()):
-        plt.plot(epochs, values, label=name, marker=markers[idx % len(markers)], color=colors[idx % len(colors)])
-    
-    plt.xlabel('Epoch', fontsize=14)
-    plt.ylabel('Metric Value', fontsize=14)
-    plt.title('Training Curves', fontsize=16)
-    plt.grid(True)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-    
-    save_path = os.path.join(output_dir, filename)
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Saved traning curve to {save_path}")
-
-def log_metrics(iou_per_class, mean_iou, mean_dice, epoch, class_names=None, log_file="metrics_log.txt"):
+def log_metrics(iou_per_class, mean_iou, mean_dice, epoch,loss_value, class_names=None, log_file="metrics_log.txt"):
     """
     Logs per-epoch loss, dice, mean IoU, and per-class IoU into a text file.
-    """  
-    if isinstance(iou_per_class, torch.Tensor):
-        iou_per_class = iou_per_class.flatten().tolist()
-
-    iou_strs = ['{:.4f}'.format(i) for i in iou_per_class]
+    """ 
     num_classes = len(iou_per_class) if class_names is None else len(class_names)
-    print(num_classes)
 
     log_string = (
-        f"Epoch {epoch} | Dice: {mean_dice:.4f} | Mean IoU: {mean_iou:.4f}\n"+
-        f"IoU per class: {iou_strs}\n"
+        f"Epoch {epoch} | Loss: {loss_value:.4f} | Dice: {mean_dice:.4f} | Mean IoU: {mean_iou:.4f}\n"
+        f"IoU per class: {['{:.4f}'.format(i) for i in iou_per_class]}\n"
         + "-"*80 + "\n"
     )
 
-    os.makedirs(os.path.dirname(os.path.join(cfg.root_path,log_file)), exist_ok=True)
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
     with open(log_file, "a") as f:
         f.write(log_string)
+
 
 def load_json(filename):
     """Reads a JSON file and returns the data as a dictionary."""
@@ -1009,6 +967,25 @@ def plot_curve(
 
 def main():
     cfg = Config()
+    # class_percentages = {
+    #     0: 52.1942,
+    #     1: 5.9224,
+    #     2: 0.5646,
+    #     3: 5.2658,
+    #     4: 0.2553,
+    #     5: 0.0,
+    #     6: 0.3799,
+    #     7: 0.0,
+    #     8: 0.1383,
+    #     9: 0.1495,
+    #     10: 0.0198,
+    #     11: 0.1139,
+    #     12: 0.2202,
+    #     13: 0.0,
+    #     14: 1.4033,
+    #     15: 0.0392,
+    #     16: 0.0
+    # }
     batch_size = 8  # Small batch size for limited data
     images_dir = os.path.join(cfg.root_path,cfg.images_dir).replace('\\','/')
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
@@ -1102,7 +1079,7 @@ def main():
                 images, masks, file_name, mask_labels = batch['image'],batch['mask'],batch['file_name'],batch['mask_labels']
 
                 # Apply transformations directly on tensors
-                images = TF.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
+                images = F.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
 
                 images = images.clone().detach().to(torch.float32)            
                 image_embeddings = sam.image_encoder(images)
@@ -1156,7 +1133,7 @@ def main():
                     for batch in val_dataloader:
                         images, masks, file_name, mask_labels = batch['image'],batch['mask'],batch['file_name'],batch['mask_labels']
                         # # Adjust tensor shape to n,64,64,c 
-                        img = TF.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
+                        img = F.resize(images, [int(cfg.img_size/16), int(cfg.img_size/16)])
 
                         img = img.clone().detach().to(torch.float32)
                         # Forward pass
@@ -1184,39 +1161,35 @@ def main():
                         # # Convert to predicted class by taking argmax along the class dimension
                         # pred_class = torch.argmax(probabilities, dim=1) ### [B,H,W]
                         # Compute IoU for each class by comparing the predicted class and ground truth class
-                        iou_mean, iou_per_class = IoU(pred_class, mask_labels, weight_of_classes=weight_tensor.to(cfg.device), num_classes=num_classes)
-                        print("IoU per class:", iou_per_class.cpu().detach().numpy()) 
+                        mean_iou, iou_per_class = IoU(pred_class,mask_labels,num_classes)
                         iou_per_class_b.append(iou_per_class)
-                        val_iou += iou_mean
-                        mean_dice,_ = dice_score(pred_class,mask_labels,num_classes, weight_tensor.to(cfg.device))
+                        val_iou += mean_iou
+                        mean_dice,_ = dice_score(pred_class,mask_labels,num_classes)
                         val_dice += mean_dice
                         os.makedirs(cfg.test_output_dir +'/' , exist_ok=True)
 
                         if val_iou.mean() > 0.3:
 
-                            for b in range(pred_class.shape[0]): 
-                                plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
+                        for b in range(pred_class.shape[0]): 
+                            plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
                             
-                                # Image.fromarray(pred_class[b].cpu().numpy().astype(np.uint8)).save(f"{cfg.test_output_dir}/{file_name[b]}_{epoch}pred_class.png")
-                                
-                                outputs = label_to_rgb(pred_class[b],mapping)
-                                image = images[b].permute(1, 2, 0).cpu().numpy()
-                                output_img = tensor2img(outputs)
-                                mask_img = tensor2img(masks[b])
+                            # Image.fromarray(pred_class[b].cpu().numpy().astype(np.uint8)).save(f"{cfg.test_output_dir}/{file_name[b]}_{epoch}pred_class.png")
+                            
+                            outputs = label_to_rgb(pred_class[b],mapping)
+                            image = images[b].permute(1, 2, 0).cpu().numpy()
+                            output_img = tensor2img(outputs)
+                            mask_img = tensor2img(masks[b])
 
-                                save_img(image, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}.png")
-                                save_img(output_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_pred.png")
-                                save_img(mask_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_Mask.png")
-                val_iou /= len(val_dataloader)
-                val_dice /= len(val_dataloader) 
-                val_iou = val_iou.mean()
-                val_dice = val_dice.mean()
-                iou_p_c_b = torch.stack(iou_per_class_b).mean(dim=0).mean(dim=0) # mean iou per class 
-                val_iou_curve.append(val_iou.item())
-                val_dice_curve.append(val_dice.item()) 
-                log_metrics(iou_p_c_b, val_iou, val_dice, epoch=epoch, class_names=list(mapping.keys()))
-
-                print(f' val_IoU: {val_iou.item():.3f}, val_dice: {val_dice.item():.3f}')    
+                            save_img(image, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}.png")
+                            save_img(output_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_pred.png")
+                            save_img(mask_img, f"{cfg.test_output_dir}/{epoch}_{file_name[b]}_Mask.png")
+                val_iou /= len(val_dataloader.dataset)
+                val_dice /= len(val_dataloader.dataset)
+                val_iou_mean = val_iou.mean()  # Compute the mean across all elements
+                val_dice_mean = val_dice.mean()  # Compute the mean across all elements    
+                iou_p_c_b = torch.stack(iou_per_class_b).mean(dim=0)    
+                print(f' val_IoU: {val_iou_mean.item():.2f}, val_dice: {val_dice_mean.item():.2f}')
+                log_metrics(iou_p_c_b, val_iou_mean, val_dice_mean, epoch=epoch,loss_value=loss,class_names=list(mapping.keys()))
                 current_val_iou=torch.nanmean(val_iou.clone().detach()).item()
                 if current_val_iou > 0.1:
                     print(f'stepping at {current_val_iou} > 0.1, lr = 5e-4')
