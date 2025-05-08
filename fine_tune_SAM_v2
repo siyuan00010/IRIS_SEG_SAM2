@@ -5,6 +5,8 @@ import cv2
 import numpy as np
 import json
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
@@ -22,10 +24,9 @@ class Config(object):
   """Change the args in the "args" variable to change the config"""
 
   def __init__(self):
-    args = arguments(
-        # root path on linux
-        # root_path = 'D:/IRIS_ANNOTATION',
-        root_path = 'C:/Users/siyuan/Documents/IRIS_DATA',
+    args = arguments( 
+        root_path = 'D:/IRIS_ANNOTATION',
+        # root_path = 'C:/Users/siyuan/Documents/IRIS_DATA',
         # json file path
         json_file_path = 'iris.json',
         images_dir = 'images',
@@ -37,9 +38,12 @@ class Config(object):
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
         # model
         model='SAM2', 
-        checkpoint_dir='C:/path/to/new/virtual/environment/IRIS_SEG_SAM2', 
-        output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_output_enhanced",
-        test_output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_prediction",
+        checkpoint_dir='D:/IRIS_ANNOTATION/checkpoints', 
+        output_dir="D:/IRIS_ANNOTATION/SAM2_output_enhanced",
+        test_output_dir="D:/IRIS_ANNOTATION/SAM_prediction",
+        # checkpoint_dir='C:/path/to/new/virtual/environment/IRIS_SEG_SAM2', 
+        # output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_output_enhanced",
+        # test_output_dir="C:/path/to/new/virtual/environment/IRIS_SEG_SAM2/SAM2_prediction",
         test_size=0.15,
         val_size=0.15, 
         train=True,
@@ -168,9 +172,6 @@ def return_dataset(image_dir, mask_dir,batch_size):
     
     img_paths = [os.path.join(image_dir, f).replace('\\','/') for f in img_files]
     mask_paths = [os.path.join(mask_dir, f).replace('\\','/') for f in mask_files]
-
-    img_paths = img_paths[:12]
-    mask_paths = mask_paths[:12]
 
     # Validate images and keep track of valid files
     valid_img_files = []
@@ -482,6 +483,7 @@ def plot_iou_curve(log_txt_path, output_dir="./", class_names=None):
         label = class_names[idx] if class_names and idx < len(class_names) else f"Class {idx}"
         plt.plot(epochs, iou_scores, label=label, marker='o', markersize=4)
 
+    plt.xticks(np.arange(min(epochs), max(epochs)+1, 1))
     plt.xlabel("Epoch", fontsize=14)
     plt.ylabel("IoU", fontsize=14)
     plt.title("Per-Class IoU Curve", fontsize=16)
@@ -1013,7 +1015,7 @@ def compute_class_percentages_from_index_masks(dataloader, mapping, num_classes=
 
 def main():
     cfg = Config()
-    batch_size = 2  # Small batch size for limited data
+    batch_size = 8  # Small batch size for limited data
     images_dir = os.path.join(cfg.root_path,cfg.images_dir).replace('\\','/')
     masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
     train_dataloader, val_dataloader, test_dataloader = return_dataset(images_dir, masks_dir,batch_size)
@@ -1068,7 +1070,7 @@ def main():
         optimizer = torch.optim.Adam(list(sam.mask_decoder.parameters()), lr=5e-3)
         best_val_iou = 0.0
         patience = 1000  # Stop if no improvement for 1000 epochs
-        epoch_size = 20
+        epoch_size = 50
         epochs_without_improvement = 0
         loss_list=[] 
         scheduler = ReduceLROnPlateau(
@@ -1184,9 +1186,10 @@ def main():
                         mean_f1, f1_per_class = f1_score_per_class(pred_class,mask_labels,num_classes,weight_of_classes=weight_tensor)
                         f1_per_class_b.append(f1_per_class)
                         val_f1 += mean_f1
+                        os.makedirs(cfg.output_dir +'/' , exist_ok=True)
                         os.makedirs(cfg.test_output_dir +'/' , exist_ok=True)
 
-                        if val_iou.mean() > 0.3:
+                        if val_iou.mean() > 0.4:
 
                             for b in range(pred_class.shape[0]): 
                                 plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],class_names=list(mapping.keys()))
