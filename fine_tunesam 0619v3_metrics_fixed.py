@@ -1,0 +1,1397 @@
+import os
+import re
+import gc
+import torch
+import cv2
+import numpy as np
+import json
+from PIL import Image
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import transforms
+import torch.nn.functional as F
+import torch.nn as nn 
+from segment_anything import sam_model_registry
+from torch.optim.lr_scheduler import ReduceLROnPlateau 
+from collections import defaultdict
+import torchvision.transforms.functional as TF
+class arguments:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+class Config(object):
+  """Change the args in the "args" variable to change the config"""
+
+  def __init__(self):
+    args = arguments( 
+        root_path = r'D:\IRIS_ANNOTATION\dataset',
+        # json file path
+        json_file_path = 'iris.json',
+        images_dir = 'images',
+        masks_dir = 'annotations',
+        # number of classes
+        num_classes = 17,
+        img_size = 1024,
+        # device
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+        # model
+        model='SAM',
+        checkpoint_dir=r'C:\path\to\new\virtual\environment\IRIS_SEG_SAM2', 
+        output_dir=r"D:\IRIS_ANNOTATION\dataset\output",
+        test_output_dir=r"D:\IRIS_ANNOTATION\dataset\val", 
+        test_size=0.1,
+        val_size=0.15, 
+        train=True,
+        resume = True
+    )
+    self.model = args.model
+    self.device = args.device
+    self.checkpoint_dir = args.checkpoint_dir
+    self.output_dir = args.output_dir
+    self.test_output_dir = args.test_output_dir
+    self.train = args.train
+    self.resume=args.resume
+    self.num_classes = args.num_classes
+    self.img_size = args.img_size
+    self.test_size = args.test_size
+    self.val_size = args.val_size
+    self.images_dir = args.images_dir
+    self.masks_dir = args.masks_dir
+    self.json_file_path = args.json_file_path
+    self.root_path = args.root_path
+
+class CreateDataset(Dataset):
+
+    """
+    create a dataset from list of images and masks
+    Return a dict of image, mask, file_name, and mask_labels
+    """
+
+    def __init__(self,img_size, image_list,mask_list,file_names):
+        self.img_size = img_size
+        self.image_list = image_list
+        self.mask_list = mask_list
+        self.file_names = file_names  
+    def __len__(self):
+        return len(self.mask_list)
+    def __getitem__(self, index):
+        image = self.image_list[index]
+        mask = self.mask_list[index]
+        file_name = self.file_names[index]
+        
+
+        if image is None:
+            raise ValueError("Error loading image. Check the file path.")
+        if mask is None:
+            raise ValueError("Error loading mask. Check the file path.")
+        
+        image = cv2.resize(image, (self.img_size, self.img_size))
+        mask = cv2.resize(mask,(self.img_size, self.img_size),interpolation=cv2.INTER_NEAREST )
+        mapping = get_mask_mappings()
+        mask_labels = replace_with_labels(mask,mapping)  
+        sample = {'image': image, 'mask': mask, 'file_name': file_name, 'mask_labels':mask_labels}
+
+        return sample
+    
+class ReturnDataset(Dataset):
+    '''
+    convert subset to dataset and return the data in tensor
+    '''   
+    def __init__(self, subset, transform):
+        self.subset = subset
+        self.transform = transform 
+    def __len__(self):
+        return len(self.subset)
+    
+    def __getitem__(self, idx):
+        sample = self.subset[idx]
+        image =  sample['image']
+        mask = sample['mask']
+
+        if self.transform:
+            image,mask = self.transform((image, mask))  # Pass as tuple   
+            return {'image': image, 'mask': mask, 'file_name': sample['file_name'], 'mask_labels': sample['mask_labels']}
+        
+        # convert to tensor
+        image = np.expand_dims(image,axis=0) # color dim expected 3 channels in image encoder
+        image = np.repeat(image,3,axis=0) 
+        image = torch.from_numpy(image)
+        mask = torch.from_numpy(mask) 
+        return {'image': image, 'mask': mask, 'file_name': sample['file_name'], 'mask_labels': sample['mask_labels']}
+    
+# transform
+class ToTensorAndNormalize:
+    '''
+    Tranform images and masks
+    Return transformed image tensor and mask tensor
+    '''
+    def __init__(self, img_size):
+        self.img_size = img_size  # Set the desired image size
+        self.random_flip = transforms.RandomHorizontalFlip(0.5) 
+
+    def __call__(self,sample):
+
+        image, mask = sample
+        image = cv2.resize(image, (self.img_size, self.img_size))
+        mask = cv2.resize(mask,(self.img_size, self.img_size),interpolation=cv2.INTER_NEAREST )
+        # histogram equalization
+        # Apply Gaussian Blur to reduce noise while preserving edges
+        blurred_image = cv2.GaussianBlur(image, (1, 1), 0)
+
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        image = clahe.apply(blurred_image)
+        image = np.array(image)
+
+        image = np.expand_dims(image,axis=0) # color dim expected 3 channels in image encoder
+        image = np.repeat(image,3,axis=0)
+
+        # convert to tensor
+        image_tensor = torch.from_numpy(image)
+        mask_tensor = torch.from_numpy(mask)
+        # print(image_tensor.shape,image_tensor.shape)
+        return image_tensor, mask_tensor
+    
+### split the full dataset     
+def split_subset(cfg,dataset):
+    num_data = len(dataset)
+    # print('dataset len:',num_data) 
+    # calculate the train, validation and test size
+    val_data_size = np.ceil(cfg.val_size*num_data).astype(int)
+    test_data_size = np.ceil(cfg.test_size*num_data).astype(int)
+    train_data_size = num_data - val_data_size - test_data_size
+    # random split the dataset 
+    train_subset, val_subset, test_subset = random_split(
+        dataset, [train_data_size,val_data_size,test_data_size],
+        generator=torch.Generator().manual_seed(42)  # Fixed seed for reproducibility
+    )
+    return train_subset, val_subset, test_subset
+
+# Create the datasets
+def return_dataset(cfg, image_dir, mask_dir,batch_size):
+
+    # Get sorted file paths and names
+    img_files = sorted(os.listdir(image_dir))
+    mask_files = sorted(os.listdir(mask_dir))
+    
+    img_paths = [os.path.join(image_dir, f).replace('\\','/') for f in img_files]
+    mask_paths = [os.path.join(mask_dir, f).replace('\\','/') for f in mask_files]
+    img_paths = img_paths[:20]
+    mask_paths = mask_paths[:20]
+
+    # Validate images and keep track of valid files
+    valid_img_files = []
+    valid_img_paths = []
+    for img_file, img_path in zip(img_files, img_paths):
+        try:
+            image = Image.open(img_path)
+            image.verify()
+            valid_img_files.append(img_file)
+            valid_img_paths.append(img_path)
+        except (IOError, SyntaxError):
+            print("Invalid image, skipping:", img_path)
+
+      # Validate masks and keep track of valid files
+    valid_mask_files = []
+    valid_mask_paths = []
+    for mask_file, mask_path in zip(mask_files, mask_paths):
+        try:
+            msk = Image.open(mask_path)
+            msk.verify()
+            valid_mask_files.append(mask_file)
+            valid_mask_paths.append(mask_path)
+        except (IOError, SyntaxError):
+            print("Invalid mask, skipping:", mask_path)
+
+    # Read only valid images and masks
+    images = [cv2.imread(path, 0) for path in valid_img_paths]  # grayscale
+    masks = [cv2.imread(path,1) for path in valid_mask_paths]
+    masks = [cv2.cvtColor(mask,cv2.COLOR_BGR2RGB) for mask in masks]
+    # Get base filenames without extension for saving predictions later
+    file_names = [os.path.splitext(f)[0] for f in valid_img_files] 
+    transform = ToTensorAndNormalize(cfg.img_size)
+    dataset = CreateDataset(cfg.img_size, images, masks, file_names) 
+
+    # Load iris subset
+    train_dataset, val_dataset, test_dataset = split_subset(cfg,dataset)
+
+    train_sample = ReturnDataset(train_dataset,transform=transform)
+    train_loader = DataLoader(
+        train_sample,
+        batch_size=batch_size,
+        shuffle=True,    # Critical for training
+        drop_last=True,
+        num_workers=1,  # 32 total nproc so 16 subprocesses
+        pin_memory=True
+    )
+    val_sample = ReturnDataset(val_dataset,transform=None)
+    val_loader = DataLoader(
+        val_sample,
+        batch_size=batch_size,
+        shuffle=False,   # No need to shuffle validation
+        drop_last=True,
+        num_workers=1
+    )
+    test_sample = ReturnDataset(test_dataset,transform=None)
+    test_loader = DataLoader(
+        test_sample,
+        batch_size=1,    # Batch size 1 for per-image evaluation
+        shuffle=False
+    )
+    return train_loader, val_loader, test_loader
+
+def tensor2img(tensor, out_type=np.uint8):
+    """
+    Convert torch Tensor to numpy image.
+    Accepts: 3D(H,W,C), or 2D(H,W)
+    Returns: numpy image (H,W,C) or (H,W)
+    """
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("Input must be a torch.Tensor")
+    if tensor.dim() not in [2, 3]:
+        raise ValueError(f"Unsupported tensor dimension: {tensor.dim()} (expected 2 or 3)")
+
+    tensor = tensor.detach().cpu().float().to(torch.uint8) 
+
+    img_np = tensor.numpy()
+    
+    if img_np.ndim == 3 and img_np.shape[0] in [1, 3]:  # CHW -> HWC
+        img_np = np.transpose(img_np, (1, 2, 0))
+
+    img = np.clip(img_np, 0, 255).astype(np.uint8)
+    # print('in tensor to img \n',img)
+
+    return img.astype(out_type)
+
+def save_img(img, img_path,upscale=4):
+    """
+    Save a numpy image to disk. Automatically handles RGB to BGR conversion for OpenCV.
+
+    Args:
+        img (np.ndarray): Image in HWC (RGB) or HW format.
+        img_path (str): Path to save image.
+    """
+    # print(f"Saving image to {img_path}, shape: {img.shape}, dtype: {img.dtype}")
+    
+    if img.ndim == 3:
+        if img.shape[2] == 3:
+            rgb_image = img.astype(np.uint8)  # ensure dtype is uint8
+            image = Image.fromarray(rgb_image)
+            if upscale > 1:
+                new_size = (image.width * upscale, image.height * upscale)
+                image = image.resize(new_size, Image.NEAREST) 
+            image.save(img_path)
+        elif img.shape[2] not in [1, 3, 4]:
+            raise ValueError(f"Unsupported number of channels: {img.shape[2]}")
+    elif img.ndim != 2:
+        raise ValueError(f"Unsupported image shape: {img.shape}")
+    # cv2.imwrite(img_path, img)
+
+def compute_iou_dice_per_class(pred_class, target, num_classes=17, smooth=1e-6):
+    """
+    pred_class: [H, W] or [1, H, W] tensor of predicted class indices
+    target: [H, W] or [1, H, W] tensor of ground truth class indices
+    """
+    if pred_class.ndim == 3:
+        pred_class = pred_class.squeeze(0)
+    if target.ndim == 3:
+        target = target.squeeze(0)
+
+    pred_class = pred_class.to(torch.long)
+    target = target.to(torch.long)
+
+    pred_onehot = F.one_hot(pred_class, num_classes=num_classes).permute(2, 0, 1).float()
+    target_onehot = F.one_hot(target, num_classes=num_classes).permute(2, 0, 1).float()
+
+    intersection = (pred_onehot * target_onehot).sum(dim=(1, 2))
+    union = pred_onehot.sum(dim=(1, 2)) + target_onehot.sum(dim=(1, 2)) - intersection
+    dice_denominator = pred_onehot.sum(dim=(1, 2)) + target_onehot.sum(dim=(1, 2))
+
+    iou = (intersection + smooth) / (union + smooth)
+    dice = (2 * intersection + smooth) / (dice_denominator + smooth)
+    return iou.cpu().numpy(), dice.cpu().numpy()
+
+def plot_per_class_iou_dice(pred_class, target, epoch, file_name, output_dir, class_names=None):
+    num_classes = pred_class.max().item() + 1 if class_names is None else len(class_names)
+    iou, dice = compute_iou_dice_per_class(pred_class, target, num_classes=num_classes)
+
+    # Remove classes not in GT (where target is all zero)
+    target_counts = torch.bincount(target.view(-1), minlength=num_classes)
+    valid_class_indices = (target_counts > 0).nonzero(as_tuple=True)[0]
+    if len(valid_class_indices) == 0:
+        print(f"[Warning] No valid class in target for {file_name}, skipping IoU/Dice plot.")
+        return
+
+    iou = iou[valid_class_indices]
+    dice = dice[valid_class_indices]
+
+    labels = [f"Class {i}" if class_names is None else class_names[i] for i in valid_class_indices]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    # fig, ax = plt.subplots(figsize=(10, 5))
+    # iou_bars=ax.bar(x - width/2, iou, width, label='IoU')
+    # dice_bars=ax.bar(x + width/2, dice, width, label='Dice')
+
+
+    # ax.set_ylabel('Score')
+    # ax.set_title('Per-class IoU and Dice')
+    # ax.set_xticks(x)
+    # ax.set_xticklabels(labels, rotation=45)
+    # ax.set_ylim(0, 1)
+    # ax.legend()
+    # plt.tight_layout()
+    # plt.savefig(f'{output_dir}/{epoch}_{file_name}.png')
+    # plt.close()
+
+def plot_loss_iou_curve(log_txt, output_dir, class_names=None):
+    # Initialize containers
+    epochs = []
+    train_losses = []
+    val_losses = []
+    train_dices = []
+    val_dices = []
+    train_ious = []
+    val_ious = []
+    train_class_ious = []
+    val_class_ious = []
+    # f1_per_classes = []
+    title = "Train"
+
+    # Read the log file
+    with open(log_txt, 'r') as f:
+        lines = f.readlines()
+    
+    for i in range(0, len(lines), 3):  # Each block is 3 lines (Epoch line, IoU line, separator)
+        epoch_line = lines[i]
+        iou_line = lines[i+1]
+        # f1_line = lines[i+2]
+        
+        # Extract epoch, loss, dice, mean IoU
+        epoch_info = re.findall(r"[-+]?\d*\.\d+|\d+", epoch_line)  # extracts all numbers
+        epoch = int(epoch_info[0])
+        # Append to lists
+        epochs.append(epoch)   
+        ##############################
+        train_log = re.findall(r"Train", epoch_line)
+        validation_log = re.findall(r"Validation", epoch_line)
+        if train_log == "Train":
+            train_loss = float(epoch_info[1])
+            train_dice = float(epoch_info[2])
+            train_iou = float(epoch_info[3])
+            train_class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+            train_class_iou = list(map(float, train_class_iou))
+            ## append to train lists
+            train_losses.append(train_loss)
+            train_dices.append(train_dice)
+            train_ious.append(train_iou)
+            train_class_ious.append(train_class_iou)
+        elif validation_log == "Validation":
+            val_loss = float(epoch_info[1])
+            val_dice = float(epoch_info[2])
+            val_iou = float(epoch_info[3])
+            val_class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+            val_class_iou = list(map(float, val_class_iou))
+            ## append to val lists
+            val_losses.append(val_loss)
+            val_dices.append(val_dice)
+            val_ious.append(val_iou)
+            val_class_ious.append(val_class_iou)
+        ############################## 
+
+        # Extract IoU per class
+        class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+        class_iou = list(map(float, class_iou))
+          
+    # Convert iou_per_classes to shape [num_epochs, num_classes]
+    val_class_ious = list(zip(*val_class_ious))  # transpose
+    # train_class_ious = list(zip(*train_class_ious))  # transpose
+    # f1_per_classes = list(zip(*f1_per_classes))  # transpose
+
+    # --- Plot Loss Curve ---
+    plt.figure(figsize=(12,6))
+    plt.plot(epochs, train_losses, label="Train Loss", color='red')
+    plt.plot(epochs, val_losses, label="Validation Loss", color='blue')
+    plt.xticks(np.arange(min(epochs),max(epochs)+1,1))
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'{title} Loss Curve')
+    plt.legend()
+    plt.grid()
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, 'loss_curve.png'))
+    plt.close()
+
+    #  # --- Plot Mean Iou,  Dice Curve ---
+    # plt.figure(figsize=(12,6)) 
+    # plt.plot(epochs, dices, label="Dice Score", color='blue')
+    # plt.plot(epochs, mean_ious, label="IoU Score", color='green')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Metrics')
+    # plt.title('Mean Dice and IoU Curve')
+    # plt.legend()
+    # plt.grid()
+    # os.makedirs(output_dir, exist_ok=True)
+    # plt.savefig(os.path.join(output_dir, 'avg_metrics_curve.png'))
+    # plt.close()
+    # print(f"Saved loss curve and IoU curve plots to {output_dir}")
+
+def log_metrics(cfg, loss_list, iou_per_class, mean_iou, mean_dice, epoch, class_names=None, train = False, log_file="metrics_log.txt"):
+    """
+    Logs per-epoch loss, dice, mean IoU, and per-class IoU into a text file.
+    """ 
+    
+    num_classes = len(iou_per_class) if class_names is None else len(class_names) 
+    loss = loss_list[len(loss_list)-1]
+    print(f'saving loss {loss:.4f} at epoch {epoch}')
+    if train:
+        log_string = (
+            f"Train Epoch {epoch} | Loss: {loss:.4f} | Dice: {mean_dice:.4f} | Mean IoU: {mean_iou:.4f}\n"# | F-1: {mean_F1:.4f}\n"
+            f"IoU per class: {['{:.4f}'.format(i) for i in iou_per_class]}\n" 
+            # f"F1 per class: {['{:.4f}'.format(i) for i in f1_per_class]}\n"
+            + "-"*80 + "\n"
+        )
+    else:
+        log_string = (
+            f"Validation Epoch {epoch} | Loss: {loss:.4f} | Dice: {mean_dice:.4f} | Mean IoU: {mean_iou:.4f}\n"# | F-1: {mean_F1:.4f}\n"
+            f"IoU per class: {['{:.4f}'.format(i) for i in iou_per_class]}\n" 
+            # f"F1 per class: {['{:.4f}'.format(i) for i in f1_per_class]}\n"
+            + "-"*80 + "\n"
+        )
+
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, "a") as f:
+        f.write(log_string)
+
+def plot_iou_curve(log_txt_path, output_dir="./", class_names=None):
+    """
+    Plots per-class IoU curve over epochs from a metrics log file.
+
+    Args:
+        log_txt_path: Path to your 'metrics_log.txt'
+        output_dir: Where to save the figure
+        class_names: List of class names, if None, use 'Class 0', 'Class 1', etc.
+    """ 
+    # Containers
+    epochs = []
+    iou_per_classes = []
+
+    # Read log file
+    with open(log_txt_path, 'r') as f:
+        lines = f.readlines()
+
+    # Each block is 4 lines: info, per-class IoU, separator
+    for i in range(0, len(lines), 3):
+        epoch_line = lines[i]
+        iou_line = lines[i+1]
+
+        # Extract epoch number
+        epoch_info = re.findall(r"[-+]?\d*\.\d+|\d+", epoch_line)
+        epoch = int(epoch_info[0])
+        epochs.append(epoch)
+
+        # Extract per-class IoU values
+        class_iou = re.findall(r"[-+]?\d*\.\d+|\d+", iou_line)
+        class_iou = list(map(float, class_iou))
+        iou_per_classes.append(class_iou)
+
+    # Convert to [num_classes, num_epochs]
+    iou_per_classes = list(zip(*iou_per_classes))  # transpose to [class, epoch]
+
+    # # Plotting
+    # plt.figure(figsize=(8, 8))
+    # for idx, iou_scores in enumerate(iou_per_classes):
+    #     label = class_names[idx] if class_names and idx < len(class_names) else f"Class {idx}"
+    #     plt.plot(epochs, iou_scores, label=label, markersize=4) #, marker='o'
+
+    # plt.xticks(np.arange(min(epochs),max(epochs)+1,1))
+    # plt.xlabel("Epoch", fontsize=14)
+    # plt.ylabel("IoU", fontsize=14)
+    # plt.title("Per-Class IoU Curve", fontsize=16)
+    # plt.ylim(0, 1.0)
+    # plt.grid(True)
+    # plt.legend(fontsize=5, ncol=10, bbox_to_anchor=(1.01, 1), loc='upper left')
+    # plt.tight_layout()
+
+    # save_path = os.path.join(output_dir, "iou_curve.png")
+    # plt.savefig(save_path)
+    # plt.close()
+    # print(f" Saved IoU curve to {save_path}")
+ 
+def load_json(filename):
+    """Reads a JSON file and returns the data as a dictionary."""
+    try:
+        with open(filename, 'r', encoding='utf-8') as file:
+            data = json.load(file)  # Load JSON data into a dictionary
+        return data  # Return the dictionary with keys and values
+    except FileNotFoundError:
+        print(f"Error: The file '{filename}' was not found.")
+        return None
+    except json.JSONDecodeError:
+        print(f"Error: The file '{filename}' is not a valid JSON file.")
+        return None
+
+def get_mask_mappings():
+    cfg = Config()
+    json_data = load_json(cfg.root_path + '/'+cfg.json_file_path)
+    keys = []
+    values = {}
+    mappings = {}
+    for key, value in json_data.items():
+        keys.append(key)
+        values.update(value)
+    for key, value in values.items():
+        # if key != 'Ridge':
+        keys.append(key)
+        mappings.setdefault(value['name'],(value['id'],value['color']))
+    # print(id_color_dict.values())
+    cfg.num_classes = len(mappings)
+    return mappings
+
+def label_to_rgb(pred_mask,mapping):
+    """
+    Convert a tensor of class indices to RGB colors based on a predefined color map
+    Args:
+        label_tensor: (H, W) tensor of class indices (int)
+    Returns:
+        rgb_tensor: (H, W,3) tensor of RGB values (0-255)
+    """
+    # Initialize RGB
+    h, w = pred_mask.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    pred_mask = pred_mask.cpu().numpy()
+    unique_labels = np.unique(pred_mask)
+    print(f"Unique labels in sample: {unique_labels}")
+
+    # Map each class to its color
+    for class_idx, color in mapping.values():
+        mask = (pred_mask == class_idx)
+        rgb[mask] = color 
+     
+    return torch.from_numpy(rgb).to(torch.uint8) 
+
+def replace_with_labels(mask: torch.Tensor, color_to_class_map: dict):
+    """
+    Converts RGB mask to class index mask using color mapping.
+    mask: Tensor of shape [H, W, 3], values in 0~255
+    Returns: Tensor of shape [H, W] with class indices
+    """
+    if isinstance(mask, np.ndarray):
+        mask = torch.from_numpy(mask).to(torch.uint8)
+    h, w, _ = mask.shape
+    label_mask = torch.zeros((h, w), dtype=torch.long)
+
+    for class_id, color in color_to_class_map.values():
+        color_tensor = torch.tensor(color, dtype=torch.uint8)
+        match = torch.all(mask == color_tensor, dim=-1)  # (H, W), boolean
+        label_mask[match] = class_id
+
+    return label_mask
+ 
+def generate_prompts_from_masks(segmented_mask,total_points=50):
+    """Generate random label-point from masks.
+        Args:
+            masks: np array (B,H,W) labeled masks.
+            total_points: Number of points to sample.
+        Returns: 
+            points:(B,N,2) normalized coordinates (N is number of points)
+            labels: (B,N) point labels (0 unlabeled, 1 eye, 2....etc)
+    """
+    B,H,W = segmented_mask.shape
+    device = segmented_mask.device
+    points1=[]
+    labels1=[]
+    for b in range(B):
+        batch_points=[] # tensor
+        batch_labels=[] # tensor
+        unique_labels = torch.unique(segmented_mask[b].cpu()) # the number of unique ids
+        # print('in batch ',b,'labels number ',unique_labels)
+        unique_labels = unique_labels[unique_labels != 0] # exclude unlabeled
+        labels = unique_labels.cpu().numpy()
+        # Vectorized extraction of coordinates for all labels at once
+        coords = torch.nonzero(segmented_mask[b] != 0, as_tuple=False)  # Get all non-background coordinates
+        coords = coords.cpu().numpy()
+        if coords.shape[0] > 0:
+            # Iterate through unique labels to assign proper labels to points
+            for label in labels:
+                # Mask for the current label
+                label_mask = (segmented_mask[b] == label)  
+                # Filter out the coordinates for this label
+                label_coords = coords[(label_mask[coords[:, 0], coords[:, 1]]), :]
+                if label_coords.size == 0:  # Skip if no points match this label
+                    continue
+                # label_coords_normalized = label_coords.float() / torch.tensor([H, W], device=device)
+                label_coords_normalized = label_coords.astype(np.float32) / np.array([H, W], dtype=np.float32)
+                # Store coordinates and corresponding label
+                batch_points.append(torch.from_numpy(label_coords_normalized))
+                batch_labels.append(torch.full((label_coords.shape[0],), label, device=device, dtype=torch.long))
+
+        if batch_points:
+            
+            # Concatenate points/labels for this batch
+            all_coords =(torch.cat(batch_points, dim=0))
+            all_labels=(torch.cat(batch_labels, dim=0))                 
+                
+        else:
+            # If no points found, pad with zeros (or any placeholder)
+            all_coords=(torch.zeros((0, 2), device=device))
+            all_labels=(torch.full((0,),0, device=device, dtype=torch.long))
+
+       # If fewer points than required, pad with zeros and label -1
+        num_points = all_coords.shape[0]
+        if num_points >= total_points:
+            indices = torch.randperm(num_points)[:total_points]
+            points = all_coords[indices]
+            points = points.to(device=device)
+            labels = all_labels[indices]
+            labels = labels.to(device=device)
+        else:
+            print('not find required number of points')
+            points = torch.cat([all_coords, torch.zeros((total_points - num_points, 2), device=device)], dim=0)
+            labels = torch.cat([all_labels, torch.full((total_points - num_points,), -1, device=device, dtype=torch.long)], dim=0)
+        
+    labels1.append(labels)
+    # scale them back to the image size (H, W)
+    points_scaled = points * torch.tensor([segmented_mask.shape[1], segmented_mask.shape[2]], dtype=torch.float)
+    points1.append(points_scaled.to(torch.int32))
+    return torch.stack(points1),torch.stack(labels1)
+# Loss functions
+def loss_function(pred, target):
+    # pred: (B, C, H, W), target: (B, H, W) with class indices
+    target = torch.from_numpy(target)
+    ce_loss = torch.nn.CrossEntropyLoss()(pred, target.long())
+    dice_loss = 1 - dice_score(pred.softmax(dim=1), target)
+    return ce_loss + dice_loss
+
+def safe_argmax(logits: torch.Tensor, target_size: tuple, mode='bilinear', align_corners=False) -> torch.Tensor:
+    """
+    Resize logits if needed, then return argmax over class dim.
+
+    Args:
+        logits: Tensor of shape [B, C, H_pred, W_pred]
+        target_size: Target spatial size (H_target, W_target)
+        mode: interpolation mode (default: bilinear)
+        align_corners: align_corners for interpolation
+
+    Returns:
+        pred_class: Tensor of shape [B, H_target, W_target], with class indices
+    """
+    if logits.shape[-2:] != target_size:
+        logits = F.interpolate(logits, size=target_size, mode=mode, align_corners=align_corners)
+    
+    return torch.argmax(logits, dim=1)
+
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes=17, smooth=1e-6,class_weights=None):
+        super().__init__()
+        self.smooth = smooth  # Prevents division by zero
+        self.num_classes = num_classes 
+        self.class_weight = class_weights if class_weights else torch.ones(num_classes)
+        self.alpha = 0.5
+        self.l1_loss = nn.L1Loss()
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: Model output (B, C, H, W) (raw scores, before softmax)
+            targets: Ground truth (B, H, W) with class indices (0-16)
+        Returns:
+            dice_loss: Scalar
+        """
+        targets = targets.long()  # Cast targets to an integer type
+        targets_onehot = F.one_hot(targets, self.num_classes).view(-1, self.num_classes, targets.shape[-2], targets.shape[-1]).permute(0, 1, 2, 3).float()
+        # Apply softmax to logits to get probabilities
+        probs = F.softmax(logits, dim=1)
+
+        dice_loss = 0.0
+        l1_loss=0.0
+        combined_loss= 0.0
+        # Calculate Dice loss for each class
+        for class_idx in range(probs.shape[1]):
+            # print("class "+str(class_idx)+": "+str(targets_onehot[:, class_idx].sum()/(256*256*3)*100)+"%")
+            # Intersection and Union for class_idx
+            intersection = (probs[:, class_idx] * targets_onehot[:, class_idx]).sum()
+            union = probs[:, class_idx].sum() + targets_onehot[:, class_idx].sum()
+            l1_loss +=  self.class_weight[class_idx]*self.l1_loss(logits[:, class_idx], targets_onehot[:, class_idx])
+            # Compute Dice loss for the class, using class weights
+            dice_loss += self.class_weight[class_idx] * (1.0 - (2.0 * intersection) / (union + self.smooth))
+            combined_loss += self.alpha * (dice_loss / self.num_classes) + (1 - self.alpha) * l1_loss
+        # Return the average Dice loss over all classes
+        return combined_loss.mean()
+ 
+class SegmentationLoss(nn.Module):
+    def __init__(self, num_classes, class_weights, dice_weight=0.2, focal_weight=0.5, ce_weight=1.0, l1_weight=0.04, smooth=1e-6, gamma = 2.0, device='cuda'):
+        super(SegmentationLoss, self).__init__()
+        self.num_classes = num_classes
+        self.class_weights = class_weights.to(device)
+        self.device = device
+        self.gamma=gamma
+        
+        self.ce_loss_fn = nn.CrossEntropyLoss(weight=self.class_weights)
+        self.l1_loss_fn = nn.L1Loss()
+        
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.ce_weight = ce_weight
+        self.l1_weight = l1_weight
+        self.smooth = smooth
+
+    def focal_loss(self, logits, targets,wce_loss):
+        """
+        Compute focal loss (multiclass)
+        Args:
+            logits: [B, C, H, W]
+            targets: [B, H, W]
+        Returns:
+            loss: scalar
+        """
+        log_probs = F.log_softmax(logits, dim=1)               # [B, C, H, W]
+        probs = torch.exp(log_probs)                           # [B, C, H, W]
+        targets_one_hot = F.one_hot(targets, self.num_classes) # [B, H, W, C]
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
+
+        ce_loss = -targets_one_hot * log_probs                 # [B, C, H, W]
+
+        focal = (1 - probs) ** self.gamma * ce_loss            # [B, C, H, W]
+
+        weighted = self.class_weights.view(1, -1, 1, 1) * focal 
+        return weighted.sum() / targets.numel()
+
+    def forward(self, pred_logits, target):
+        """
+        pred_logits: Tensor [B, C, H, W] (raw model output)
+        target: Tensor [B, H, W] (class indices)
+        """
+        pred_logits = pred_logits.to(self.device)
+        target = target.to(self.device)
+
+        # Cross-Entropy Loss
+        ce_loss = self.ce_loss_fn(pred_logits, target) 
+
+        # Focal Loss
+        focal = self.focal_loss(pred_logits, target,ce_loss) 
+
+        # L1 Loss between predicted probabilities and one-hot labels
+        pred_probs = F.softmax(pred_logits, dim=1)
+        target_onehot = F.one_hot(target, self.num_classes).permute(0, 3, 1, 2).float()
+        l1 = self.l1_loss_fn(pred_probs, target_onehot) 
+
+        # Dice Loss 
+        dice_mean, _ = soft_dice_score(pred_probs, target_onehot, weight_of_classes=self.class_weights, num_classes=self.num_classes)
+        # print(f'dice mean in loss {dice_mean}')
+        dice_mean = torch.clamp(dice_mean, 0, 1)
+        dice_loss = 1 - dice_mean 
+
+        # Patch Dice Loss
+        pred_class = torch.argmax(pred_logits, dim=1)  # [B, H, W] 
+        patch_dice = patch_dice_score(pred_class, target_onehot, num_classes=self.num_classes)
+        patch_dice_loss = 1 - patch_dice
+        print(f'cross entropy loss {ce_loss:.3f} focal loss {focal:.3f} l1 loss {l1:.3f} dice loss: {dice_loss:.3f} patch dice loss {patch_dice_loss:.3f}')
+
+        # Entropy Loss to encourage confident predictions
+        entropy = -torch.sum(pred_probs * torch.log(pred_probs + self.smooth), dim=1).mean()
+
+        # Combine losses
+        total_loss = (
+            self.dice_weight * dice_loss +
+            self.focal_weight * focal +
+            self.ce_weight * ce_loss +
+            self.l1_weight * l1 +
+            0.05 * patch_dice_loss +
+            0.01 * entropy
+        )
+
+        return total_loss
+
+def soft_dice_score(pred_probs, target_onehot,num_classes,weight_of_classes=None, smooth=1e-6):
+    """
+    Args: 
+        pred: B,H,W,
+        target: B, H, W in class indices
+    Returns:
+        mean_dice: Scalar mean Dice score across all classes
+        dice_per_class: Tensor of shape [B, num_classes] with per-class Dice
+    """  
+    dice_per_class = ((2. * (pred_probs * target_onehot).sum(dim=(2, 3)) + smooth) / \
+                    (pred_probs.sum(dim=(2, 3)) + target_onehot.sum(dim=(2, 3)) + smooth)) /num_classes
+ 
+    if weight_of_classes is not None: 
+        weight_of_classes = weight_of_classes.to(pred_probs.device) 
+
+        dice_mean = (dice_per_class.sum(dim=0) * weight_of_classes).sum() / weight_of_classes.sum()
+    else:
+        dice_mean = dice_per_class.mean()
+
+    return dice_mean, dice_per_class  # [scalar], [B, C]
+
+def dice_score(pred_class, target,num_classes,weight_of_classes=None, smooth=1e-6):
+    """
+    Args: 
+        pred: B,H,W,
+        target: B, H, W in class indices
+    Returns:
+        mean_dice: Scalar mean Dice score across all classes
+        dice_per_class: Tensor of shape [B, num_classes] with per-class Dice
+    """
+
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
+    target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+ 
+    dice_per_class = ((2. * (pred_onehot * target_onehot).sum(dim=(2, 3)) + smooth) / \
+                    (pred_onehot.sum(dim=(2, 3)) + target_onehot.sum(dim=(2, 3)) + smooth))
+
+    # # Exclude background class (assuming class `0` is background)
+    # dice_per_class = ((2. * (pred_onehot[:, 1:] * target_onehot[:, 1:]).sum(dim=(2, 3)) + smooth) / \
+    #                 (pred_onehot[:, 1:].sum(dim=(2, 3)) + target_onehot[:, 1:].sum(dim=(2, 3)) + smooth))/(num_classes-1)
+    if weight_of_classes is not None: 
+        weight_of_classes = weight_of_classes.to(pred_onehot.device)
+        # weight_of_classes = weight_of_classes[1:]
+        dice_per_class = dice_per_class * weight_of_classes
+
+        dice_mean = dice_per_class.sum() / weight_of_classes.sum()
+    else:
+        dice_mean = dice_per_class.mean()
+
+    return dice_mean, dice_per_class  # [scalar], [B, C]
+
+def patch_dice_score(pred_class, target_onehot, num_classes, n_splits=4, smooth=1e-6):
+    """
+    Computes average Dice score over patches.
+    Both pred_class and target are shape [B, H, W]
+    """
+    B, H, W = pred_class.shape
+    h_step = H // n_splits
+    w_step = W // n_splits
+
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float() 
+
+    patch_dice_total = 0.0
+    count = 0
+
+    for i in range(n_splits):
+        for j in range(n_splits):
+            h_start, h_end = i * h_step, (i + 1) * h_step
+            w_start, w_end = j * w_step, (j + 1) * w_step
+
+            # pred_patch = pred_onehot[:, 1:, h_start:h_end, w_start:w_end]
+            # target_patch = target_onehot[:, 1:, h_start:h_end, w_start:w_end]
+            pred_patch = pred_onehot[:, :, h_start:h_end, w_start:w_end]
+            target_patch = target_onehot[:, :, h_start:h_end, w_start:w_end]
+
+            inter = (pred_patch * target_patch).sum(dim=(2, 3))
+            union = pred_patch.sum(dim=(2, 3)) + target_patch.sum(dim=(2, 3))
+
+            dice = (2 * inter + smooth) / (union + smooth) /num_classes
+            patch_dice_total += dice.mean()
+            count += 1
+
+    return patch_dice_total / count
+
+def f1_score_per_class(pred_class, target, num_classes, weight_of_classes=None, smooth=1e-6):
+    """
+    Computes mean F1 score and per-class F1.
+
+    Args:
+        pred_class: Tensor of shape [B, H, W] with predicted class indices
+        target: Tensor of shape [B, H, W] with ground truth class indices
+        num_classes: Total number of classes
+        weight_of_classes: Optional tensor of shape [num_classes] for weighted average
+        smooth: Small value to prevent division by zero
+
+    Returns:
+        mean_f1: Scalar mean F1 score across all classes
+        f1_per_class: Tensor of shape [B, num_classes] with per-class F1
+    """
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
+    target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
+
+    # Compute true positives, precision, and recall 
+    tp = (pred_onehot[:, 1:] * target_onehot[:, 1:]).sum(dim=(2, 3))  # shape: [B, C-1]
+    precision = (tp + smooth) / (pred_onehot[:, 1:].sum(dim=(2, 3)) + smooth)
+    recall = (tp + smooth) / (target_onehot[:, 1:].sum(dim=(2, 3)) + smooth)
+
+    # F1 per class
+    f1_per_class = ((2 * precision * recall) / (precision + recall + smooth))/(num_classes-1)  # shape: [B, C-1]
+
+    # Weighted or unweighted mean F1
+    if weight_of_classes is not None:
+        weights = weight_of_classes.to(f1_per_class.device)[1:]  # remove background
+        mean_f1 = (f1_per_class * weights).sum() / weights.sum()
+    else:
+        mean_f1 = f1_per_class.mean()
+
+    return mean_f1, f1_per_class
+ 
+def IoU(pred_class, target, num_classes, weight_of_classes=None, smooth=1e-6):
+    """
+    Compute mean and per-class IoU, excluding background class (assumed to be class 0).
+    
+    Returns:
+        iou_mean: Tensor of shape [B], average over non-background classes
+        iou_per_class: Tensor of shape [B, num_classes - 1]
+    """
+    device = target.device  
+    pred_class = torch.clamp(pred_class, 0, num_classes - 1) 
+    target = torch.clamp(target, 0, num_classes - 1) 
+    pred_onehot = F.one_hot(pred_class, num_classes).permute(0, 3, 1, 2).float()
+    target_onehot = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float() 
+    pred_onehot = pred_onehot.to(device)
+    target_onehot = target_onehot.to(device)
+    
+    intersection = (pred_onehot * target_onehot).sum(dim=(2, 3)) 
+    union = pred_onehot.sum(dim=(2, 3)) + target_onehot.sum(dim=(2, 3)) 
+
+    iou_per_class = (intersection+ smooth) / (union + smooth)   
+
+    if weight_of_classes is not None:
+        weights = weight_of_classes.to(device) 
+        iou_per_class = iou_per_class*weights
+        # mIoU = (iou_per_class.sum(dim=0) * weights).sum() / weights.sum()
+        mIoU = iou_per_class.sum() / weights.sum()
+    else:
+        mIoU = iou_per_class.mean()
+
+    return mIoU, iou_per_class 
+
+def get_class_weights(class_percentages: dict, num_classes: int = 17,
+                      min_weight: float = 1.0, max_weight: float = 10.0,
+                      background_class: int = 0, background_weight: float = 1.0) -> torch.Tensor:
+    """
+    Generate normalized class weights with inverse-frequency scaling.
+    
+    Args:
+        class_percentages: Dict mapping class index to percentage (0–100)
+        num_classes: Total number of classes
+        min_weight: Minimum allowed weight
+        max_weight: Maximum allowed weight
+        background_class: Index of background class (usually 0)
+        background_weight: Weight to manually set for background class
+        
+    Returns:
+        torch.Tensor of shape [num_classes]
+    """
+    # Convert percentages to proportions
+    proportions = {k: v / 100 for k, v in class_percentages.items()}
+
+    # Compute inverse weights
+    weights = []
+    for cls in range(num_classes):
+        prop = proportions.get(cls, 0.0)
+        if prop > 0:
+            w = 1.0 / prop
+            w = max(min_weight, min(w, max_weight))
+        else:
+            w = min_weight 
+
+        weights.append(w)
+
+    # Manually override background class
+    weights[background_class] = background_weight 
+    # # Normalize weights
+    # total = sum(weights)
+    # final_weights = [w / total for w in weights]
+
+
+    # # Re-normalize again after background adjustment
+    # total_after_bg = sum(normalized_weights)
+    # final_weights = [w / total_after_bg for w in normalized_weights] 
+    return torch.tensor(weights, dtype=torch.float32)
+
+def plot_class_distribution(class_percentages: dict, class_names=None, output_dir="./", filename="class_distribution.png"):
+    """
+    Plots and saves a bar chart of class pixel percentage distribution.
+
+    Args:
+        class_percentages: dict {class_id: percentage}
+        class_names: optional list of class names, e.g., ["Background", "Iris", ...]
+        output_dir: where to save the figure
+        filename: output filename
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    class_ids = list(class_percentages.keys())
+    percentages = [class_percentages[k] for k in class_ids]
+
+    labels = [str(k) if class_names is None else class_names[k] for k in class_ids]
+
+    plt.figure(figsize=(12, 6))
+    bars = plt.bar(class_ids, percentages, tick_label=labels)
+    plt.xticks(rotation=45)
+    plt.ylabel("Pixel Percentage (%)")
+    plt.title("Class Distribution in Dataset")
+
+    # Annotate percentages on top
+    for bar, pct in zip(bars, percentages):
+        plt.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(), f'{pct:.2f}%', ha='center', va='bottom')
+
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, filename)
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved class distribution plot to {save_path}")
+
+def compute_class_percentages_from_index_masks(cfg, dataloader, mapping, num_classes=17, verbose=False):
+    """
+    Computes average class percentages from a dataloader where mask is already class indices [B, H, W].
+
+    Args:
+        dataloader: PyTorch DataLoader yielding batches with key 'mask' (LongTensor of class indices)
+        num_classes: total number of classes
+        verbose: whether to print per-batch progress
+
+    Returns:
+        dict: class index → percentage over all pixels
+    """
+    total_counts = defaultdict(int)
+    total_pixels = 0 
+
+    for batch_idx, batch in enumerate(dataloader):
+        masks = batch['mask_labels']  # [B, H, W]
+        if masks.ndim == 4:
+            masks = masks.squeeze(1)  # If shape is [B, 1, H, W]
+
+        masks = masks.long().cpu()  # Ensure long type
+        total_pixels += masks.numel()
+
+        for class_idx in range(num_classes):
+            total_counts[class_idx] += (masks == class_idx).sum().item()
+
+        if verbose:
+            print(f"Processed batch {batch_idx + 1}/{len(dataloader)}")
+
+    # Compute percentages
+    class_percentages = {}
+    for i in range(num_classes):
+        count = total_counts.get(i, 0)
+        percent = (count / total_pixels) * 100 if total_pixels > 0 else 0.0
+        class_percentages[i] = round(percent, 4)
+    # plot_class_distribution(class_percentages, class_names=list(mapping.keys()), output_dir=cfg.output_dir)
+    return class_percentages
+  
+def main():
+    cfg = Config()
+    batch_size = 1  # Small batch size for limited data
+    images_dir = os.path.join(cfg.root_path,cfg.images_dir).replace('\\','/')
+    masks_dir = os.path.join(cfg.root_path,cfg.masks_dir).replace('\\','/')
+    train_dataloader, val_dataloader, test_dataloader = return_dataset(cfg, images_dir, masks_dir,batch_size) 
+    print(len(train_dataloader.dataset))
+
+    os.makedirs(cfg.output_dir +'/' , exist_ok=True)
+    os.makedirs(cfg.test_output_dir +'/' , exist_ok=True)
+    
+    mapping = get_mask_mappings() 
+    # Load the checkpoint state_dict
+    model_state_dict = torch.load(f"{cfg.checkpoint_dir}/sam_vit_b_01ec64.pth", weights_only=True)
+
+    # Extract only the encoder state_dict
+    encoder_state_dict = {k: v for k, v in model_state_dict.items() if 'encoder' in k}
+
+    # Initialize the SAM model (encoder and decoder)
+    sam = sam_model_registry["vit_b"](checkpoint=None)  # Don't load the full checkpoint here
+    sam.to(cfg.device)
+
+    # Load the encoder weights into the model
+    sam.image_encoder.load_state_dict(encoder_state_dict, strict=False)  # Strict=False will ignore missing keys
+    hidden_dim = sam.mask_decoder.iou_token.weight.shape[1] 
+    # Adjust the mask_tokens and IOU head to match the number of classes
+    sam.mask_decoder.mask_tokens = nn.Embedding(cfg.num_classes, hidden_dim).to(device=cfg.device)  # Change to num_classes tokens
+
+    nn.init.normal_(sam.mask_decoder.mask_tokens.weight, mean=0.0, std=0.01)
+    nn.init.xavier_uniform_(sam.mask_decoder.mask_tokens.weight)
+
+    sam.mask_decoder.iou_prediction_head =  nn.Sequential(
+                                            nn.Linear(hidden_dim, hidden_dim),
+                                            nn.ReLU(),
+                                            nn.Linear(hidden_dim, cfg.num_classes)  # Update for num_classes classes
+                                            ).to(device=cfg.device)
+    
+    # training
+    if cfg.train:
+        # Freeze the image encoder (no gradients)
+        for param in sam.image_encoder.parameters():
+            param.requires_grad = False # <--- unfreeze for >10k images 
+        # Unfreeze the mask decoder (fine-tune it)
+        for param in sam.mask_decoder.parameters():
+            param.requires_grad = True  # <--- Only change from earlier!
+
+        class_percentages = compute_class_percentages_from_index_masks(cfg, train_dataloader, mapping, num_classes=cfg.num_classes, verbose=False)
+
+        weight_tensor = get_class_weights(class_percentages, num_classes=cfg.num_classes)  
+    
+        # Loss and optimizer (only affects the decoder) 
+        criterion = SegmentationLoss(
+                            num_classes=cfg.num_classes,
+                            class_weights=weight_tensor,
+                            dice_weight=1.0,
+                            focal_weight=1.0,
+                            ce_weight=1.0,
+                            device=cfg.device
+                        )
+        optimizer = torch.optim.AdamW(list(sam.mask_decoder.parameters()), lr=1e-4, weight_decay=1e-2) # small lr for fine tuning 
+        best_val_iou = 0.0
+        patience = 200  # Stop if no improvement for 1000 epochs
+        epoch_size = 500
+        epochs_without_improvement = 0
+        train_loss_list=[] 
+        val_loss_list=[]  
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer=optimizer,gamma=0.95,last_epoch=-1)
+        # scheduler = ReduceLROnPlateau(
+        #     optimizer, mode="max", factor=0.95, patience=10
+        # ) 
+        if cfg.resume:
+            resume_path = f"{cfg.checkpoint_dir}/best_iris_{cfg.model}.pth"
+            checkpoint = torch.load(resume_path, map_location=cfg.device, weights_only=True)    
+            sam.load_state_dict(checkpoint['model'], strict=True)
+            optimizer.load_state_dict(checkpoint['optimizer'])
+
+            start_epoch = checkpoint['epoch'] + 1
+            loss = checkpoint['loss']
+            train_loss_list.append(loss)
+
+            print(f"Checkpoint loaded from {resume_path}, resume from epoch {start_epoch}, loss: {loss:.4f}") 
+        else:
+            start_epoch = 1
+
+        print(f"{start_epoch}/{epoch_size}")
+        for epoch in range(start_epoch, epoch_size): 
+            # Training phase
+            loss_total = 0.0
+            sam.train()
+            i=0
+            train_iou = 0.0
+            train_dice = 0.0
+            train_iou_per_class_b = [] 
+            for batch in train_dataloader:
+                images, masks, file_name, mask_labels = batch['image'],batch['mask'],batch['file_name'],batch['mask_labels']
+
+                # Apply transformations directly on tensors
+                # images = TF.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
+
+                images = images.clone().detach().to(torch.float32).to(cfg.device)   
+                image_embeddings = sam.image_encoder(images).to(cfg.device) 
+
+                points,labels = generate_prompts_from_masks(mask_labels,total_points=640)
+                points = points.to(cfg.device)
+                labels = labels.to(cfg.device)
+                mask_labels = mask_labels.unsqueeze(1)
+                mask_labels = mask_labels.to(cfg.device)  
+                # if i==0:
+                #     print(f"model {next(sam.parameters()).device}")
+                #     print(f"img {images.device}") 
+                #     print(f"mask_labels {mask_labels.device}")
+                #     print(f"points and labels {points.device} {labels.device}")
+                sparse_embeddings, _          = sam.prompt_encoder(
+                    points=(points, labels),
+                    boxes=None,
+                    masks=mask_labels.clone().detach().to(torch.float32)
+                )
+                dense_embeddings = sam.prompt_encoder.get_dense_pe()
+                mask_labels = mask_labels.squeeze(1) 
+
+                outputs,_ = sam.mask_decoder(image_embeddings=image_embeddings,
+                                            image_pe=sam.prompt_encoder.get_dense_pe(),
+                                            sparse_prompt_embeddings=sparse_embeddings,
+                                            dense_prompt_embeddings=dense_embeddings,
+                                            multimask_output=True) 
+                num_classes = outputs.shape[1] 
+                pred_class = safe_argmax(outputs, mask_labels.shape[-2:]) 
+                # Compute IoU for each class by comparing the predicted class and ground truth class
+                mean_iou, iou_per_class = IoU(pred_class,mask_labels,num_classes,weight_of_classes=None)
+                train_iou_per_class_b.append(iou_per_class)
+                train_iou += mean_iou.item()
+                mean_dice,_ = dice_score(pred_class,mask_labels,num_classes,weight_of_classes=None)
+                train_dice += mean_dice.item() 
+
+                # print(outputs.shape)##[B,C,H,W]# Resize logits before passing to loss
+                if outputs.shape[-2:] != mask_labels.shape[-2:]:
+                    outputs = F.interpolate(outputs, size=mask_labels.shape[-2:], mode='bilinear', align_corners=False)
+
+                # Pass raw logits into loss
+                loss = criterion(outputs, mask_labels)
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_total += loss.item() 
+                i+=1
+                print(f'step {i}/{np.ceil(len(train_dataloader.dataset)/batch_size).astype(int)}, loss: {loss:.3f}')
+            avg_train_iou = train_iou/ len(train_dataloader)
+            avg_train_dice = train_dice/ len(train_dataloader)
+            avg_loss = loss_total / len(train_dataloader)  
+            train_loss_list.append(avg_loss)
+            scheduler.step()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+
+            train_iou_p_c_b = torch.stack(train_iou_per_class_b).mean(dim=1).mean(dim=0).cpu().numpy()      
+            print(f'avg_train_iou: {avg_train_iou:.3f}, avg_train_dice: {avg_train_dice:.3f} ') 
+            log_metrics(cfg, train_loss_list, train_iou_p_c_b, mean_iou=avg_train_iou, mean_dice=avg_train_dice, epoch=epoch, class_names=list(mapping.keys()), train=True,log_file=os.path.join(cfg.root_path,"metrics_log_exp.txt"))
+            print(f"Epoch {epoch+1}/{epoch_size}, Avg Loss: {avg_loss:.4f}") 
+            os.makedirs(os.path.join(cfg.test_output_dir,f'epoch_{epoch}'),exist_ok=True)
+            
+
+            # Validation phase
+            if (len(val_dataloader)>0):
+                sam.eval() 
+                val_loss_total = 0.0
+                val_iou = 0.0
+                val_dice = 0.0 
+                val_loss_list = []
+                iou_per_class_b = [] 
+                with torch.no_grad():
+                    for batch in val_dataloader:
+                        images, masks, file_name, mask_labels = batch['image'],batch['mask'],batch['file_name'],batch['mask_labels']
+                        # # Adjust tensor shape to n,64,64,c 
+                        # img = TF.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
+
+                        img = images.clone().detach().to(torch.float32).to(cfg.device)
+                        # Forward pass
+                        image_embeddings = sam.image_encoder(img)
+                        points,labels = generate_prompts_from_masks(mask_labels,total_points=50)
+                        points = points.to(cfg.device)
+                        labels = labels.to(cfg.device)
+                        mask_labels = mask_labels.unsqueeze(1)
+                        mask_labels = mask_labels.to(cfg.device)  
+                         
+                        
+                        sparse_embeddings, _          = sam.prompt_encoder(
+                            points=(points, labels),
+                            boxes=None,
+                            masks=mask_labels.clone().detach().to(torch.float32)
+                        )
+                        dense_embeddings = sam.prompt_encoder.get_dense_pe()
+                        mask_labels = mask_labels.squeeze(1)
+                        raw_logits,_ = sam.mask_decoder(image_embeddings=image_embeddings,
+                                                    image_pe=sam.prompt_encoder.get_dense_pe(),
+                                                    sparse_prompt_embeddings=sparse_embeddings,
+                                                    dense_prompt_embeddings=dense_embeddings,
+                                                    multimask_output=True)
+                        # right after you get raw_logits, before val_loss = ...
+                        if raw_logits.shape[-2:] != mask_labels.shape[-2:]:
+                            raw_logits = F.interpolate(
+                                raw_logits,
+                                size=mask_labels.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False
+                            ) 
+                        # Pass raw logits into loss
+                        val_loss = criterion(raw_logits, mask_labels)
+                        val_loss_total += val_loss.item()  
+                        # print(raw_logits.shape)##[B,N,H,W]
+                        num_classes = raw_logits.shape[1] 
+                        pred_class = safe_argmax(raw_logits, mask_labels.shape[-2:]) 
+                        # Compute IoU for each class by comparing the predicted class and ground truth class
+                        mean_iou, iou_per_class = IoU(pred_class,mask_labels,num_classes,weight_of_classes=None)
+                        iou_per_class_b.append(iou_per_class)
+                        val_iou += mean_iou 
+                        mean_dice,_ = dice_score(pred_class,mask_labels,num_classes,weight_of_classes=None)
+                        val_dice += mean_dice 
+
+                        for b in range(pred_class.shape[0]): 
+                            # plot_per_class_iou_dice(pred_class[b], mask_labels[b], epoch = epoch, file_name=file_name[b],output_dir=f"{cfg.test_output_dir}/epoch_{epoch}", class_names=list(mapping.keys()))
+                                
+                            outputs = label_to_rgb(pred_class[b],mapping)
+                            image = images[b].permute(1, 2, 0).cpu().numpy()
+                            output_img = tensor2img(outputs)
+                            mask_img = tensor2img(masks[b])
+
+                            save_img(image, f"{cfg.test_output_dir}/epoch_{epoch}/{file_name[b]}.png")
+                            save_img(mask_img, f"{cfg.test_output_dir}/epoch_{epoch}/{file_name[b]}_Mask.png")
+                            save_img(output_img, f"{cfg.test_output_dir}/epoch_{epoch}/{file_name[b]}_pred.png")
+                        avg_val_iou = val_iou/ len(val_dataloader)
+                        avg_val_dice = val_dice/ len(val_dataloader)
+                        avg_loss = val_loss_total / len(val_dataloader)  
+                        val_loss_list.append(avg_loss)
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
+                iou_p_c_b = torch.stack(iou_per_class_b).mean(dim=1).mean(dim=0).cpu().numpy()      
+                print(f'val_IoU: {avg_val_iou:.3f}, val_dice: {avg_val_dice:.3f}') 
+                log_metrics(cfg, val_loss_list, iou_p_c_b, avg_val_iou, avg_val_dice, epoch=epoch, class_names=list(mapping.keys()), train=False, log_file=os.path.join(cfg.root_path,"metrics_log_exp.txt"))
+                current_val_iou=avg_val_iou
+                # if 50 < epoch <= 100:
+                #     print(f'Using lr = 4')
+                #     scheduler.step(1e-4) 
+                # elif 100 < epoch <= 200:
+                #     print(f'Using lr = 5')
+                #     scheduler.step(1e-5)
+                # else:
+                #     print('learning rate == 1e-3')
+                # Check validation IoU 
+                if current_val_iou > best_val_iou:
+                    best_val_iou = current_val_iou
+                    epochs_without_improvement = 0
+                    # best iou checkpoint
+                    torch.save({
+                    "epoch": epoch,
+                    "model": sam.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "loss":loss,
+                    },  f"{cfg.checkpoint_dir}/best_iris_{cfg.model}.pth")
+                    print(f"Saved best model at epoch {epoch} with IoU {best_val_iou:.4f}")
+                
+                else:
+                    epochs_without_improvement += 1
+                    if epochs_without_improvement >= patience:
+                        print(f"Early stopping at epoch {epoch}")
+                        break
+            
+            # Save periodic checkpoint
+            if epoch % 10 == 0:
+                torch.save({
+                    "epoch": epoch,
+                    "model": sam.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "loss":loss,
+                }, f"{cfg.checkpoint_dir}/epoch_{epoch}_test.pth")
+            # if (epoch + 1) % 10 == 0 or epoch == epoch_size-1:
+                # plot_loss_iou_curve(os.path.join(cfg.root_path,"metrics_log.txt"), cfg.root_path, class_names=list(mapping.keys()))
+            #     plot_iou_curve(os.path.join(cfg.root_path,"metrics_log.txt"), cfg.root_path, class_names=list(mapping.keys()))
+
+       
+    if (len(test_dataloader)>0):  
+        pth = f"{cfg.checkpoint_dir}/best_iris_{cfg.model}.pth"
+        checkpoint = torch.load(pth, map_location=cfg.device, weights_only=True)   
+        sam.load_state_dict(checkpoint['model'], strict=False)
+        optimizer.load_state_dict(checkpoint['optimizer']) 
+
+        # Evaluation
+        sam.eval()
+        with torch.no_grad():
+            for batch in test_dataloader:
+                images, masks, file_name, mask_labels = batch['image'],batch['mask'],batch['file_name'],batch['mask_labels']
+                # Adjust tensor shape to n,64,64,c
+                # images = TF.resize(images, [int(cfg.img_size//16), int(cfg.img_size//16)])
+                img = images.clone().detach().to(torch.float32).to(cfg.device) #float for image encoder
+                image_embeddings = sam.image_encoder(img)
+                sparse_embeddings, dense_embeddings = sam.prompt_encoder(
+                            points = None,
+                            boxes = None,
+                            masks = None
+                        )
+                logits,_ = sam.mask_decoder(image_embeddings=image_embeddings,
+                                        image_pe=sam.prompt_encoder.get_dense_pe(),
+                                        sparse_prompt_embeddings=sparse_embeddings,
+                                        dense_prompt_embeddings=dense_embeddings,
+                                        multimask_output=True)
+                # logits = torch.softmax(logits, dim=1)
+                # preds = logits.argmax(dim=1)  # (B,H, W) class indices
+
+                preds = safe_argmax(logits, mask_labels.shape[-2:])
+                os.makedirs(os.path.join(cfg.root_path,'test/'),exist_ok=True)
+                for b in range(preds.shape[0]):
+                    rgb_pred = label_to_rgb(preds[b],mapping)
+                    save_path = f"{cfg.root_path}/test/{file_name[b]}.png"
+                    save_img(tensor2img(rgb_pred), save_path)
+
+if __name__ == '__main__':
+    # Necessary for multiprocessing in Windows
+    from torch.multiprocessing import set_start_method
+    try:
+        set_start_method('spawn')  # Ensure spawn method is used on Windows
+    except RuntimeError:
+        pass  # If the start method is already set, ignore the error
+    main()  # Start the main function
